@@ -1,0 +1,11 @@
+# ============================================================
+# Experiment 2 — Offline Augmentation
+# Noise is added once during preprocessing (04_build_tensors.py).
+# The augmented tensors are saved to disk and reused every epoch.
+# ============================================================
+defaults:
+  - base
+
+augmentation:
+  enabled: true
+  mode: "offline"

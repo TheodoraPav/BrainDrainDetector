@@ -1,0 +1,65 @@
+# ============================================================
+# Base configuration — shared across all experiments
+# ============================================================
+
+paths:
+  data_raw: "Data"
+  data_processed: "data_processed"
+  figures: "figures"
+  checkpoints: "checkpoints"
+
+# ============================================================
+# Data
+# ============================================================
+data:
+  window_size_sec: 5          # annotation granularity is 5 seconds
+  audio_sample_rate: 16000    # Hz — Wav2Vec2 expects 16kHz
+  vad_min_speech_pct: 0.60    # keep windows with >= 60% speech
+  vad_max_speech_pct: 0.90    # keep windows with <= 90% speech
+  e4_signals: ["EDA", "HR", "IBI"]
+  eeg_signals: ["theta", "alpha", "beta"]
+
+# ============================================================
+# Labels
+# ============================================================
+labels:
+  # Class 1: Overloaded
+  overloaded_max_valence: 3
+  overloaded_min_arousal: 4
+  overloaded_negative_emotions: ["frustration", "confusion", "nervous"]
+  # Class 0: Optimal
+  optimal_min_valence: 3
+  optimal_required_emotion: "concentration"
+  optimal_forbidden_emotions: ["frustration", "confusion", "nervous", "angry", "sad", "boredom"]
+
+# ============================================================
+# Model
+# ============================================================
+model:
+  audio_encoder: "wav2vec2"   # options: "wav2vec2", "resnet18"
+  biosignal_hidden_size: 128
+  biosignal_num_layers: 2
+  fusion_num_heads: 4
+  fusion_dropout: 0.1
+  num_classes: 3
+
+# ============================================================
+# Training
+# ============================================================
+training:
+  epochs: 50
+  batch_size: 32
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  seed: 42
+
+# ============================================================
+# Augmentation — overridden per experiment
+# ============================================================
+augmentation:
+  enabled: false
+  mode: null                  # "offline" or "online"
+  sensor_noise_std: 0.02      # applied only if e4 completeness == 1.0
+  audio_gaussian_std: 0.005
+  spec_augment_time_mask: 30  # max time steps to mask
+  spec_augment_freq_mask: 10  # max frequency bins to mask
