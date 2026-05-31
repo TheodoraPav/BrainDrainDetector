@@ -6,6 +6,10 @@ Two backends are supported, selected via config:
   - "resnet18"  : lightweight 1D ResNet18 trained from scratch
 
 Both produce a tensor of shape (batch, embedding_dim).
+
+When `freeze_backbone=True` (default), the pretrained Wav2Vec2 weights are kept
+fixed during training. Only the biosignal encoder, fusion layer, and
+classification head receive gradient updates.
 """
 
 import torch
@@ -13,13 +17,29 @@ import torch.nn as nn
 from transformers import Wav2Vec2Model
 
 
+def _freeze_module(module: nn.Module) -> None:
+    """Disables gradient updates for every parameter in `module`."""
+    for param in module.parameters():
+        param.requires_grad = False
+
+
 class Wav2Vec2Encoder(nn.Module):
     """Wraps pretrained Wav2Vec2 and adds a mean-pooling step."""
 
-    def __init__(self):
+    def __init__(self, freeze_backbone: bool = True):
         super().__init__()
         self.backbone = Wav2Vec2Model.from_pretrained("facebook/wav2vec2-base")
         self.embedding_dim = 768  # wav2vec2-base hidden size
+        self.freeze_backbone = freeze_backbone
+        if freeze_backbone:
+            _freeze_module(self.backbone)
+
+    def train(self, mode: bool = True):
+        """Keeps the frozen backbone in eval mode even when the rest of the model trains."""
+        super().train(mode)
+        if self.freeze_backbone:
+            self.backbone.eval()
+        return self
 
     def forward(self, waveform: torch.Tensor) -> torch.Tensor:
         # waveform: (batch, samples)
@@ -93,11 +113,16 @@ class AudioEncoder(nn.Module):
     Both backends output shape (batch, embedding_dim).
     """
 
-    def __init__(self, backend: str = "wav2vec2"):
+    def __init__(self, backend: str = "wav2vec2", freeze_backbone: bool = True):
         super().__init__()
         if backend == "wav2vec2":
-            self.encoder = Wav2Vec2Encoder()
+            self.encoder = Wav2Vec2Encoder(freeze_backbone=freeze_backbone)
         elif backend == "resnet18":
+            if freeze_backbone:
+                raise ValueError(
+                    "freeze_audio_backbone=true is only supported for audio_encoder='wav2vec2'. "
+                    "Set freeze_audio_backbone=false when using resnet18."
+                )
             self.encoder = ResNet18Encoder()
         else:
             raise ValueError(f"Unknown audio encoder backend: {backend}")

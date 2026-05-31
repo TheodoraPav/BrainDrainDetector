@@ -14,8 +14,14 @@ paths:
 data:
   window_size_sec: 5          # annotation granularity is 5 seconds
   audio_sample_rate: 16000    # Hz — Wav2Vec2 expects 16kHz
-  vad_min_speech_pct: 0.60    # keep windows with >= 60% speech
-  vad_max_speech_pct: 0.90    # keep windows with <= 90% speech
+  # Speaker diarization (stereo debates): mute the other speaker before VAD
+  diarization_dilate_ms: 80.0   # expand speech masks slightly at word edges
+  diarization_min_gap_sec: 3.0  # fill short dropouts within one speaker's turn
+  # Global VAD overlap filter:
+  #   1) run VAD once on the diarized mono track
+  #   2) keep a 5-second window when enough of it overlaps with speech regions
+  vad_min_overlap_sec: 3.0    # keep when at least 3 seconds inside the window are speech
+  vad_min_overlap_pct: 0.60    # or when speech covers at least 60% of the window
   e4_signals: ["EDA", "HR", "IBI"]
   eeg_signals: ["theta", "alpha", "beta"]
 
@@ -37,11 +43,18 @@ labels:
 # ============================================================
 model:
   audio_encoder: "wav2vec2"   # options: "wav2vec2", "resnet18"
+  # Keep the pretrained Wav2Vec2 weights fixed. Only BiGRU, fusion, and head train.
+  # Applies only when audio_encoder is "wav2vec2".
+  freeze_audio_backbone: true
   biosignal_hidden_size: 128
   biosignal_num_layers: 2
   fusion_num_heads: 4
   fusion_dropout: 0.1
   num_classes: 3
+  # Fusion layer selection.
+  #   cross_attn_pooled   -> baseline cross-attention with a pooled biosignal token (default)
+  #   sequence_cross_attn -> audio query attends over the BiGRU output sequence (extra option)
+  fusion_mode: "cross_attn_pooled"
 
 # ============================================================
 # Training
@@ -52,13 +65,14 @@ training:
   learning_rate: 0.0001
   weight_decay: 0.0001
   seed: 42
+  # Balanced sampling: K = median(n_i) per participant per epoch (see dataset.py)
+  balanced_sampling: true
 
 # ============================================================
 # Augmentation — overridden per experiment
 # ============================================================
 augmentation:
-  enabled: false
-  mode: null                  # "offline" or "online"
+  enabled: false              # true = use pre-augmented tensors from windows_aug/ (see 04_build_tensors.py)
   sensor_noise_std: 0.02      # applied only if e4 completeness == 1.0
   audio_gaussian_std: 0.005
   spec_augment_time_mask: 30  # max time steps to mask

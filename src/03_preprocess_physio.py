@@ -4,7 +4,7 @@ Step 3 — Preprocess physiological signals (E4 + NeuroSky EEG).
 For each participant:
   1. Load E4 signals: EDA, HR, IBI from e4_data/{participant}/
   2. Load NeuroSky EEG signals: theta, alpha, beta from neurosky_polar_data/{participant}/BrainWave.csv
-  3. Align all signals to 5-second windows using the annotation timestamps.
+  3. Align all signals to the same fixed 5-second annotation grid used by audio preprocessing.
   4. Normalize each signal to zero mean and unit variance (z-score).
   5. Save each window as a tensor in data_processed/physio/.
 
@@ -23,6 +23,10 @@ import pandas as pd
 from pathlib import Path
 from omegaconf import OmegaConf
 from scipy.interpolate import interp1d
+
+import sys
+sys.path.insert(0, str(Path(__file__).parent))
+from utils.pipeline_log import format_count_summary, log_participant_counts, log_stats, stage_ok, stage_start
 
 
 def load_e4_signal(participant_dir: Path, signal_name: str) -> pd.DataFrame:
@@ -138,6 +142,8 @@ def z_score_normalize(tensor: torch.Tensor) -> torch.Tensor:
 
 
 def main(cfg):
+    stage_start("03", "preprocess E4 + NeuroSky physio signals")
+
     e4_dir         = Path(cfg.paths.data_raw) / "e4_data" / "e4_data"
     neurosky_dir   = Path(cfg.paths.data_raw) / "neurosky_polar_data" / "neurosky_polar_data"
     output_dir     = Path(cfg.paths.data_processed) / "physio"
@@ -147,6 +153,8 @@ def main(cfg):
     target_steps_per_window = 50  # 10 Hz internal grid per 5-second window
 
     participant_dirs = sorted(e4_dir.iterdir(), key=lambda p: int(p.name))
+    counts_by_participant: dict[str, int] = {}
+    skipped_participants: list[str] = []
     print(f"Found {len(participant_dirs)} participant E4 folders.")
 
     for part_dir in participant_dirs:
@@ -159,6 +167,7 @@ def main(cfg):
             ibi_df = load_ibi(part_dir)
         except Exception as e:
             print(f"  {participant_id}: Skipping E4 — {e}")
+            skipped_participants.append(participant_id)
             continue
 
         # ── Load NeuroSky EEG ────────────────────────────────────────────────
@@ -167,6 +176,7 @@ def main(cfg):
             eeg_df = load_eeg_signals(neuro_part_dir)
         except Exception as e:
             print(f"  {participant_id}: Skipping EEG — {e}")
+            skipped_participants.append(participant_id)
             continue
 
         # Build unified signal dict: name → (timestamps, values)
@@ -181,6 +191,7 @@ def main(cfg):
                 signal_dict[eeg_col] = (eeg_df.index.values.astype(float), eeg_df[eeg_col].values)
 
         windows = extract_windows(signal_dict, window_size_sec, target_steps_per_window)
+        counts_by_participant[participant_id] = len(windows)
         print(f"  {participant_id}: {len(windows)} physio windows extracted")
 
         for window_dict in windows:
@@ -193,7 +204,20 @@ def main(cfg):
             filename = f"{participant_id}_sec{window_dict['seconds']:04d}.pt"
             torch.save(save_dict, output_dir / filename)
 
-    print(f"\nPhysio preprocessing complete. Files saved to {output_dir}")
+        print(f"  [STEP 03 STAT] participant={participant_id} status=ok windows={len(windows)}")
+
+    total_windows = sum(counts_by_participant.values())
+    log_stats("03", {
+        "participants_processed": len(counts_by_participant),
+        "participants_skipped": len(skipped_participants),
+        "total_windows": total_windows,
+        "windows_per_participant": format_count_summary(counts_by_participant.values()),
+        "output_dir": str(output_dir),
+    })
+    if skipped_participants:
+        log_stats("03", {"skipped": ",".join(skipped_participants)})
+    log_participant_counts("03", counts_by_participant)
+    stage_ok("03", f"saved {total_windows} physio windows for {len(counts_by_participant)} participants")
 
 
 if __name__ == "__main__":

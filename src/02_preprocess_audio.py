@@ -2,160 +2,342 @@
 Step 2 — Preprocess audio.
 
 For each stereo debate WAV file (e.g. p1.p2.wav):
-  1. Split stereo into two mono channels (left = participant odd, right = participant even).
-  2. Segment each mono channel into 5-second windows (matching annotation granularity).
-  3. Run Voice Activity Detection (VAD) via PyAnnote Audio.
-  4. Keep only windows where speech_percentage is between 60% and 90%.
-  5. Save each accepted window as a float32 tensor in data_processed/audio/.
+  1. Diarize the mono mix and separate speakers (mute the other speaker).
+  2. Run Voice Activity Detection (VAD) once on each separated mono track.
+  3. Walk the fixed 5-second annotation grid (0-5, 5-10, 10-15, ...).
+  4. Keep windows whose overlap with the global speech timeline is large enough.
+  5. Save each accepted window to data_processed/audio/.
+
+Optional --testing flag:
+  Also writes playable .wav files under data_processed/audio_preview/{participant}/
+  and CSV summaries for diarization + final windows.
 
 Output: data_processed/audio/P{N}_sec{T}.pt
-  Each .pt file is a dict: {"waveform": tensor(samples,), "participant": "P1", "seconds": 5}
+  Each .pt file is a dict:
+    {
+      "waveform": tensor(num_samples,),
+      "participant": "P1",
+      "seconds": 5,
+      "speech_overlap_sec": 4.2,
+    }
 
 Usage:
     python src/02_preprocess_audio.py --config configs/base.yaml
+    python src/02_preprocess_audio.py --config configs/base.yaml --testing
 """
 
+from __future__ import annotations
+
 import argparse
+import csv
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+import numpy as np
+import soundfile as sf
 import torch
 import torchaudio
-from pathlib import Path
 from omegaconf import OmegaConf
-from pyannote.audio import Pipeline
+
+sys.path.insert(0, str(Path(__file__).parent))
+
+from utils.diarization import load_diarization_pipeline, parse_participants, separate_stereo_speakers
+from utils.pipeline_log import format_count_summary, log_participant_counts, log_stats, stage_ok, stage_start
+from utils.vad import (
+    detect_speech_segments,
+    load_vad_pipeline,
+    speech_overlap_seconds,
+    window_passes_overlap_filter,
+)
 
 
-def load_vad_pipeline() -> Pipeline:
-    """Loads the PyAnnote Voice Activity Detection pipeline."""
-    pipeline = Pipeline.from_pretrained("pyannote/voice-activity-detection")
-    return pipeline
+def load_wav(path: Path) -> tuple[torch.Tensor, int]:
+    """Loads stereo WAV without torchcodec (soundfile backend)."""
+    data, sample_rate = sf.read(str(path), always_2d=True)
+    waveform = torch.from_numpy(data.T).float()
+    return waveform, sample_rate
 
 
-def split_stereo(waveform: torch.Tensor) -> tuple:
+def resample_mono(waveform: torch.Tensor, orig_sr: int, target_sr: int) -> torch.Tensor:
+    if orig_sr == target_sr:
+        return waveform
+    resampler = torchaudio.transforms.Resample(orig_freq=orig_sr, new_freq=target_sr)
+    return resampler(waveform.unsqueeze(0)).squeeze(0)
+
+
+def extract_windows_with_global_vad(
+    waveform: torch.Tensor,
+    participant_id: str,
+    sample_rate: int,
+    window_size_sec: int,
+    speech_segments: list,
+    min_overlap_sec: float,
+    min_overlap_pct: float,
+) -> list[dict]:
     """
-    Splits a stereo waveform into two mono channels.
+    Builds 5-second annotation windows and filters them using global VAD overlap.
 
-    Args:
-        waveform: (2, samples) tensor
-
-    Returns:
-        left_channel, right_channel — each (samples,) tensor
-    """
-    left_channel  = waveform[0]
-    right_channel = waveform[1]
-    return left_channel, right_channel
-
-
-def compute_speech_percentage(
-        waveform: torch.Tensor, sample_rate: int, vad_pipeline: Pipeline
-) -> float:
-    """
-    Runs VAD on a single-channel waveform segment and returns speech percentage.
-
-    Args:
-        waveform:    (samples,) tensor — one 5-second window
-        sample_rate: audio sample rate in Hz
-
-    Returns:
-        fraction of the window that contains speech (0.0 to 1.0)
-    """
-    audio_dict = {"waveform": waveform.unsqueeze(0), "sample_rate": sample_rate}
-    vad_output = vad_pipeline(audio_dict)
-
-    total_duration  = len(waveform) / sample_rate
-    speech_duration = sum(
-        segment.end - segment.start for segment, _ in vad_output.itertracks(yield_label=True)
-    )
-    return speech_duration / total_duration if total_duration > 0 else 0.0
-
-
-def segment_and_filter(
-        waveform: torch.Tensor,
-        participant_id: str,
-        sample_rate: int,
-        window_size_sec: int,
-        vad_min: float,
-        vad_max: float,
-        vad_pipeline: Pipeline,
-) -> list:
-    """
-    Splits a full-length mono waveform into 5-second windows and filters by VAD.
-
-    Returns:
-        list of dicts, each with {"waveform", "participant", "seconds"}
+    The first kept window is annotated at seconds=5 and covers audio [0, 5).
     """
     samples_per_window = sample_rate * window_size_sec
     total_samples = len(waveform)
-    accepted_windows = []
+    accepted_windows: list[dict] = []
 
     window_start_sample = 0
-    window_seconds      = window_size_sec  # first window covers seconds 0 to 5, annotated at second 5
+    annotation_seconds = window_size_sec
 
     while window_start_sample + samples_per_window <= total_samples:
-        window = waveform[window_start_sample : window_start_sample + samples_per_window]
-        speech_pct = compute_speech_percentage(window, sample_rate, vad_pipeline)
+        window_start_sec = window_start_sample / sample_rate
+        window_end_sec = window_start_sec + window_size_sec
 
-        if vad_min <= speech_pct <= vad_max:
+        overlap_sec = speech_overlap_seconds(
+            window_start_sec,
+            window_end_sec,
+            speech_segments,
+        )
+
+        if window_passes_overlap_filter(
+            overlap_sec,
+            window_size_sec,
+            min_overlap_sec,
+            min_overlap_pct,
+        ):
+            window_audio = waveform[
+                window_start_sample : window_start_sample + samples_per_window
+            ]
             accepted_windows.append({
-                "waveform":    window.clone(),
-                "participant": participant_id,
-                "seconds":     window_seconds,
+                "waveform":           window_audio.clone(),
+                "participant":        participant_id,
+                "seconds":            annotation_seconds,
+                "speech_overlap_sec": round(overlap_sec, 3),
             })
 
         window_start_sample += samples_per_window
-        window_seconds      += window_size_sec
+        annotation_seconds += window_size_sec
 
     return accepted_windows
 
 
-def main(cfg):
-    audio_dir  = Path(cfg.paths.data_raw) / "debate_audios" / "debate_audios"
+def process_separated_channel(
+    channel_waveform: torch.Tensor,
+    participant_id: str,
+    sample_rate: int,
+    window_size_sec: int,
+    min_overlap_sec: float,
+    min_overlap_pct: float,
+    vad_pipeline,
+) -> list[dict]:
+    """Runs global VAD on a diarized mono track, then selects valid 5-second windows."""
+    speech_segments = detect_speech_segments(
+        channel_waveform,
+        sample_rate,
+        vad_pipeline,
+    )
+
+    return extract_windows_with_global_vad(
+        waveform=channel_waveform,
+        participant_id=participant_id,
+        sample_rate=sample_rate,
+        window_size_sec=window_size_sec,
+        speech_segments=speech_segments,
+        min_overlap_sec=min_overlap_sec,
+        min_overlap_pct=min_overlap_pct,
+    )
+
+
+def save_window_as_wav(window_dict: dict, wav_path: Path, sample_rate: int) -> None:
+    wav_path.parent.mkdir(parents=True, exist_ok=True)
+    sf.write(str(wav_path), window_dict["waveform"].numpy(), sample_rate)
+
+
+def build_preview_wav_name(window_dict: dict) -> str:
+    participant = window_dict["participant"]
+    seconds = window_dict["seconds"]
+    overlap = window_dict["speech_overlap_sec"]
+    return f"{participant}_sec{seconds:04d}_overlap{overlap:.1f}s.wav"
+
+
+def write_csv(rows: list[dict], path: Path, fieldnames: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def print_diarization_assignment(result) -> None:
+    print("  Diarization assignment:")
+    for speaker, participant in result.speaker_to_participant.items():
+        speaker_dur = sum(
+            row["duration_sec"]
+            for row in result.segments
+            if row["diarized_speaker"] == speaker
+        )
+        print(f"    {speaker} -> {participant} ({speaker_dur:.1f}s diarized speech)")
+
+
+def print_testing_summary(counts_by_participant: dict[str, int], preview_dir: Path) -> None:
+    print("\nTesting preview summary (5s windows kept per speaker):")
+    for participant in sorted(counts_by_participant, key=lambda p: int(p[1:])):
+        print(f"  {participant}: {counts_by_participant[participant]} windows")
+    print(f"  TOTAL: {sum(counts_by_participant.values())} windows")
+    print(f"  Window previews: {preview_dir}")
+    print(f"  Window summary:  {preview_dir / 'summary.csv'}")
+
+
+def main(cfg, testing: bool = False) -> None:
+    stage_start("02", "preprocess audio (diarization -> VAD -> 5s windows)")
+
+    audio_dir = Path(cfg.paths.data_raw) / "debate_audios" / "debate_audios"
     output_dir = Path(cfg.paths.data_processed) / "audio"
+    diarization_dir = Path(cfg.paths.data_processed) / "audio_diarization"
+    preview_dir = Path(cfg.paths.data_processed) / "audio_preview"
+
     output_dir.mkdir(parents=True, exist_ok=True)
+    diarization_dir.mkdir(parents=True, exist_ok=True)
 
-    sample_rate     = cfg.data.audio_sample_rate
+    sample_rate = cfg.data.audio_sample_rate
     window_size_sec = cfg.data.window_size_sec
-    vad_min         = cfg.data.vad_min_speech_pct
-    vad_max         = cfg.data.vad_max_speech_pct
+    min_overlap_sec = cfg.data.vad_min_overlap_sec
+    min_overlap_pct = cfg.data.vad_min_overlap_pct
+    dilate_ms = cfg.data.diarization_dilate_ms
+    min_gap_sec = cfg.data.diarization_min_gap_sec
 
+    summary_rows: list[dict] = []
+    counts_by_participant: dict[str, int] = defaultdict(int)
+    debates_processed = 0
+
+    print("Loading diarization pipeline...")
+    diarization_pipeline = load_diarization_pipeline()
+    print("Loading VAD pipeline...")
     vad_pipeline = load_vad_pipeline()
 
     wav_files = sorted(audio_dir.glob("p*.wav"))
     print(f"Found {len(wav_files)} stereo audio files.")
+    print(
+        "Pipeline: diarization -> VAD -> 5s windows | "
+        f"keep when overlap >= {min_overlap_sec}s OR >= {min_overlap_pct:.0%}"
+    )
+    if testing:
+        print(f"Testing mode ON: exporting previews to {preview_dir}")
 
     for wav_path in wav_files:
-        # File name format: p1.p2.wav → participants P1 and P2
-        stem = wav_path.stem  # "p1.p2"
-        parts = stem.split(".")
-        p_left  = "P" + parts[0][1:]  # "p1" → "P1"
-        p_right = "P" + parts[1][1:]  # "p2" → "P2"
+        participant_left, participant_right = parse_participants(wav_path.stem)
+        waveform, file_sample_rate = load_wav(wav_path)
 
-        waveform, file_sr = torchaudio.load(wav_path)
+        left_np = waveform[0].numpy()
+        right_np = waveform[1].numpy()
 
-        # Resample if needed
-        if file_sr != sample_rate:
-            resampler = torchaudio.transforms.Resample(orig_freq=file_sr, new_freq=sample_rate)
-            waveform  = resampler(waveform)
+        print(f"\nProcessing {wav_path.name}: {participant_left} (left), {participant_right} (right)")
 
-        left_channel, right_channel = split_stereo(waveform)
-        print(f"Processing {wav_path.name}: {p_left} (left) and {p_right} (right)")
+        diarized = separate_stereo_speakers(
+            left=left_np,
+            right=right_np,
+            sample_rate=file_sample_rate,
+            pipeline=diarization_pipeline,
+            participant_left=participant_left,
+            participant_right=participant_right,
+            uri=wav_path.stem,
+            dilate_ms=dilate_ms,
+            min_gap_sec=min_gap_sec,
+        )
+        print_diarization_assignment(diarized)
 
-        for channel_waveform, participant_id in [(left_channel, p_left), (right_channel, p_right)]:
-            windows = segment_and_filter(
-                channel_waveform, participant_id, sample_rate,
-                window_size_sec, vad_min, vad_max, vad_pipeline
+        debate_diar_dir = diarization_dir / wav_path.stem
+        write_csv(
+            [{**row, "source_file": wav_path.name} for row in diarized.segments],
+            debate_diar_dir / "segments.csv",
+            fieldnames=[
+                "source_file",
+                "diarized_speaker",
+                "assigned_participant",
+                "start_sec",
+                "end_sec",
+                "duration_sec",
+            ],
+        )
+
+        if testing:
+            sf.write(str(debate_diar_dir / f"{participant_left}_diarized.wav"), diarized.left_track, file_sample_rate)
+            sf.write(str(debate_diar_dir / f"{participant_right}_diarized.wav"), diarized.right_track, file_sample_rate)
+
+        for channel_np, participant_id in [
+            (diarized.left_track, participant_left),
+            (diarized.right_track, participant_right),
+        ]:
+            channel_waveform = resample_mono(
+                torch.from_numpy(channel_np).float(),
+                file_sample_rate,
+                sample_rate,
             )
-            print(f"  {participant_id}: {len(windows)} windows passed VAD filter")
+
+            windows = process_separated_channel(
+                channel_waveform=channel_waveform,
+                participant_id=participant_id,
+                sample_rate=sample_rate,
+                window_size_sec=window_size_sec,
+                min_overlap_sec=min_overlap_sec,
+                min_overlap_pct=min_overlap_pct,
+                vad_pipeline=vad_pipeline,
+            )
+            print(f"  {participant_id}: {len(windows)} windows kept after diarization + VAD")
 
             for window_dict in windows:
-                filename = f"{window_dict['participant']}_sec{window_dict['seconds']:04d}.pt"
-                torch.save(window_dict, output_dir / filename)
+                pt_filename = f"{window_dict['participant']}_sec{window_dict['seconds']:04d}.pt"
+                torch.save(window_dict, output_dir / pt_filename)
+                counts_by_participant[window_dict["participant"]] += 1
 
-    print(f"\nAudio preprocessing complete. Files saved to {output_dir}")
+                if testing:
+                    wav_filename = build_preview_wav_name(window_dict)
+                    preview_wav_path = preview_dir / window_dict["participant"] / wav_filename
+                    save_window_as_wav(window_dict, preview_wav_path, sample_rate)
+
+                    summary_rows.append({
+                        "participant": window_dict["participant"],
+                        "seconds": window_dict["seconds"],
+                        "speech_overlap_sec": window_dict["speech_overlap_sec"],
+                        "pt_filename": pt_filename,
+                        "wav_filename": str(preview_wav_path.relative_to(preview_dir)),
+                    })
+
+        debates_processed += 1
+        print(f"  [STEP 02 STAT] debate={wav_path.stem} status=ok")
+
+    total_windows = sum(counts_by_participant.values())
+    log_stats("02", {
+        "debates_processed": debates_processed,
+        "participants_with_audio": len(counts_by_participant),
+        "total_windows": total_windows,
+        "windows_per_participant": format_count_summary(counts_by_participant.values()),
+        "vad_min_overlap_sec": min_overlap_sec,
+        "vad_min_overlap_pct": min_overlap_pct,
+        "output_audio_dir": str(output_dir),
+        "output_diarization_dir": str(diarization_dir),
+        "testing_mode": testing,
+    })
+    log_participant_counts("02", dict(counts_by_participant))
+
+    if testing:
+        write_csv(
+            summary_rows,
+            preview_dir / "summary.csv",
+            fieldnames=["participant", "seconds", "speech_overlap_sec", "pt_filename", "wav_filename"],
+        )
+        print_testing_summary(counts_by_participant, preview_dir)
+
+    stage_ok("02", f"saved {total_windows} audio windows from {debates_processed} debates")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="configs/base.yaml")
+    parser.add_argument(
+        "--testing",
+        action="store_true",
+        help="Export diarized full tracks, 5s window WAV previews, and CSV summaries",
+    )
     args = parser.parse_args()
 
     cfg = OmegaConf.load(args.config)
-    main(cfg)
+    main(cfg, testing=args.testing)

@@ -7,7 +7,9 @@ Functions:
   plot_confusion_matrix   : heatmap of predicted vs true labels
   plot_f1_comparison      : grouped bar chart comparing F1 across experiments
   plot_roc_curves         : one-vs-rest ROC curves for each class
-  plot_attention_map      : heatmap of Cross-Attention weights over a single sample
+  plot_attention_map         : heatmap of Cross-Attention weights (pooled fusion: 1x1 per head)
+  plot_attention_over_time   : heatmap and line plot of attention weights over biosignal time steps
+                               (used by the sequence_cross_attn fusion)
 """
 
 import numpy as np
@@ -128,10 +130,11 @@ def plot_attention_map(
     title: str = "Cross-Attention Weights",
 ) -> str:
     """
-    Visualizes the attention weights from the CrossAttentionFusion layer.
+    Visualizes the attention weights from the pooled CrossAttentionFusion layer.
 
     Args:
-        attention_weights: (num_heads, query_len, key_len) numpy array
+        attention_weights: (num_heads, query_len, key_len) numpy array.
+                           For cross_attn_pooled this is (num_heads, 1, 1).
     """
     fig, axes = plt.subplots(1, attention_weights.shape[0], figsize=(3 * attention_weights.shape[0], 3))
     if attention_weights.shape[0] == 1:
@@ -149,6 +152,62 @@ def plot_attention_map(
             yticklabels=["Audio"],
         )
         ax.set_title(f"Head {head_idx + 1}")
+
+    fig.suptitle(title)
+    plt.tight_layout()
+    save_path = _ensure_figures_dir(figures_dir) / filename
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
+    return str(save_path)
+
+
+def plot_attention_over_time(
+    attention_weights: np.ndarray,
+    figures_dir: str,
+    filename: str = "attention_over_time.png",
+    title: str = "Sequence Cross-Attention Weights",
+    time_axis_label: str = "Biosignal time step",
+) -> str:
+    """
+    Visualizes the attention weights from the SequenceCrossAttentionFusion layer.
+
+    The audio is a single query token attending over T biosignal time steps,
+    so for each head the weights are a distribution over T values.
+
+    Two views are drawn side by side:
+      - Left  : heatmap of shape (num_heads, T). One row per attention head.
+      - Right : line plot, one curve per head, weight vs time step.
+
+    Args:
+        attention_weights: (num_heads, T) numpy array. Rows already sum to 1.
+    """
+    num_heads, time_steps = attention_weights.shape
+
+    fig, (ax_heatmap, ax_lines) = plt.subplots(1, 2, figsize=(11, 3 + 0.3 * num_heads))
+
+    head_labels = [f"H{idx + 1}" for idx in range(num_heads)]
+
+    sns.heatmap(
+        attention_weights,
+        ax=ax_heatmap,
+        cmap="viridis",
+        vmin=0.0,
+        cbar=True,
+        yticklabels=head_labels,
+        xticklabels=False,
+    )
+    ax_heatmap.set_xlabel(time_axis_label)
+    ax_heatmap.set_ylabel("Attention head")
+    ax_heatmap.set_title("Heatmap")
+
+    time_index = np.arange(time_steps)
+    for head_idx in range(num_heads):
+        ax_lines.plot(time_index, attention_weights[head_idx], label=head_labels[head_idx])
+    ax_lines.set_xlabel(time_axis_label)
+    ax_lines.set_ylabel("Attention weight")
+    ax_lines.set_ylim(bottom=0.0)
+    ax_lines.set_title("Per head curves")
+    ax_lines.legend(loc="upper right", fontsize=8)
 
     fig.suptitle(title)
     plt.tight_layout()

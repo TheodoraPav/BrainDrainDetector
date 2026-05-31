@@ -6,4 +6,3 @@ defaults:
 
 augmentation:
   enabled: false
-  mode: null

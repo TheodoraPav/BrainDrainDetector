@@ -20,10 +20,14 @@ Usage:
 import argparse
 import torch
 import pandas as pd
+from collections import defaultdict
 from pathlib import Path
 from omegaconf import OmegaConf
 
+import sys
+sys.path.insert(0, str(Path(__file__).parent))
 from data.augmentation import SensorNoise, AudioGaussianNoise, ComposeAugmentations
+from utils.pipeline_log import format_count_summary, log_participant_counts, log_stats, stage_ok, stage_start
 from utils.quality import build_quality_map
 
 
@@ -62,6 +66,8 @@ def build_offline_augmentation(cfg, quality_map: dict, participant_idx: int):
 
 
 def main(cfg):
+    stage_start("04", "join audio + physio + labels into final window tensors")
+
     audio_dir  = Path(cfg.paths.data_processed) / "audio"
     physio_dir = Path(cfg.paths.data_processed) / "physio"
     labels_csv = Path(cfg.paths.data_processed) / "labels.csv"
@@ -72,9 +78,7 @@ def main(cfg):
     audio_index = load_audio_index(audio_dir)
     physio_index = load_physio_index(physio_dir)
 
-    offline_aug_enabled = (
-        cfg.augmentation.enabled and cfg.augmentation.mode == "offline"
-    )
+    offline_aug_enabled = cfg.augmentation.enabled
     if offline_aug_enabled:
         aug_output_dir = Path(cfg.paths.data_processed) / "windows_aug"
         aug_output_dir.mkdir(parents=True, exist_ok=True)
@@ -86,6 +90,8 @@ def main(cfg):
 
     saved_count   = 0
     skipped_count = 0
+    counts_by_participant: dict[str, int] = defaultdict(int)
+    label_counts: dict[int, int] = defaultdict(int)
 
     for _, row in labels_df.iterrows():
         participant = row["participant"]
@@ -107,6 +113,8 @@ def main(cfg):
         filename = f"{participant}_sec{seconds:04d}.pt"
         torch.save(sample, output_dir / filename)
         saved_count += 1
+        counts_by_participant[participant] += 1
+        label_counts[label] += 1
 
         if offline_aug_enabled:
             participant_idx = int(participant[1:]) - 1  # "P3" → 2
@@ -117,8 +125,23 @@ def main(cfg):
             aug_sample = {**sample, "waveform": aug_waveform, "biosignals": aug_biosignals}
             torch.save(aug_sample, aug_output_dir / filename)
 
-    print(f"\nSaved: {saved_count} windows  |  Skipped (missing modality): {skipped_count}")
-    print(f"Final windows saved to {output_dir}")
+    log_stats("04", {
+        "saved_windows": saved_count,
+        "skipped_missing_modality": skipped_count,
+        "audio_files_indexed": len(audio_index),
+        "physio_files_indexed": len(physio_index),
+        "label_rows_total": len(labels_df),
+        "windows_per_participant": format_count_summary(counts_by_participant.values()),
+        "class_0_optimal": label_counts.get(0, 0),
+        "class_1_overloaded": label_counts.get(1, 0),
+        "class_2_grey": label_counts.get(2, 0),
+        "offline_augmentation": offline_aug_enabled,
+        "output_dir": str(output_dir),
+    })
+    if offline_aug_enabled:
+        log_stats("04", {"output_aug_dir": str(aug_output_dir)})
+    log_participant_counts("04", dict(counts_by_participant))
+    stage_ok("04", f"saved {saved_count} joined windows ({skipped_count} skipped)")
 
 
 if __name__ == "__main__":

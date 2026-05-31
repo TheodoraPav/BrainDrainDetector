@@ -9,8 +9,8 @@ Loads LOSO results from 05_train.py and generates:
 All figures are saved to figures/ and referenced in the LaTeX report.
 
 Usage:
-    python src/06_evaluate.py --config configs/exp_online_aug.yaml
-    python src/06_evaluate.py --config configs/exp_online_aug.yaml --compare-all
+    python src/06_evaluate.py --config configs/exp_baseline.yaml
+    python src/06_evaluate.py --config configs/exp_offline_aug.yaml --compare-all
 """
 
 import argparse
@@ -23,6 +23,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent))
 
 from utils.metrics import compute_metrics, print_classification_report, average_metrics_across_folds
+from utils.pipeline_log import log_stats, stage_ok, stage_start
 from utils.plotting import plot_confusion_matrix, plot_f1_comparison, plot_roc_curves
 
 
@@ -51,11 +52,19 @@ def load_experiment_summary(results_path: Path) -> dict:
 
 
 def main(cfg, compare_all: bool = False):
+    stage_start("06", "evaluation and plot generation")
+
     results_path  = Path(cfg.paths.data_processed) / "loso_results.pt"
     figures_dir   = cfg.paths.figures
 
     print(f"Loading results from {results_path}")
     summary, fold_metrics = load_experiment_summary(results_path)
+
+    log_stats("06", {
+        "results_file": str(results_path),
+        "folds_loaded": len(fold_metrics),
+        **{f"summary_{key}": round(value, 4) if isinstance(value, float) else value for key, value in summary.items()},
+    })
 
     print("\n=== LOSO Results ===")
     for key, value in summary.items():
@@ -73,8 +82,8 @@ def main(cfg, compare_all: bool = False):
 
     # ── F1 comparison across experiments ────────────────────────────────────
     if compare_all:
-        experiment_names = ["Baseline", "Offline Aug", "Online Aug"]
-        config_paths     = ["configs/exp_baseline.yaml", "configs/exp_offline_aug.yaml", "configs/exp_online_aug.yaml"]
+        experiment_names = ["Baseline", "Offline Aug"]
+        config_paths     = ["configs/exp_baseline.yaml", "configs/exp_offline_aug.yaml"]
 
         experiment_results = {}
         for exp_name, config_path in zip(experiment_names, config_paths):
@@ -90,11 +99,13 @@ def main(cfg, compare_all: bool = False):
             f1_path = plot_f1_comparison(experiment_results, figures_dir)
             print(f"F1 comparison chart saved: {f1_path}")
 
+    stage_ok("06", f"evaluation complete — figures in {figures_dir}")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config",      type=str, default="configs/base.yaml")
-    parser.add_argument("--compare-all", action="store_true", help="Generate F1 comparison across all 3 experiments")
+    parser.add_argument("--compare-all", action="store_true", help="Generate F1 comparison across baseline and offline augmentation")
     args = parser.parse_args()
 
     cfg = OmegaConf.load(args.config)
