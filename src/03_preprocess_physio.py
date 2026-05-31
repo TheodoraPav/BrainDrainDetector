@@ -38,9 +38,11 @@ from utils.pipeline_log import format_count_summary, log_participant_counts, log
 
 def find_subjects_csv(data_raw: Path) -> Path | None:
     """Locate subjects.csv with debate start/end timestamps (K-EmoCon metadata)."""
+    repo_root = Path(__file__).resolve().parent.parent
     candidates = [
         data_raw / "metadata" / "metadata" / "subjects.csv",
         data_raw / "metadata" / "subjects.csv",
+        repo_root / "assets" / "kemocon" / "subjects.csv",
     ]
     for path in candidates:
         if path.is_file():
