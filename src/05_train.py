@@ -434,6 +434,12 @@ def main(cfg):
 
     print(f"Loaded {len(samples)} total windows from {windows_dir}/.")
 
+    if not samples:
+        raise RuntimeError(
+            f"No training samples found in {Path(cfg.paths.data_processed) / windows_dir}. "
+            "Step 04 likely saved 0 windows — check step 03 (physio) output first."
+        )
+
     print(f"Running LOSO cross-validation over {len(participant_ids)} participants.")
 
 

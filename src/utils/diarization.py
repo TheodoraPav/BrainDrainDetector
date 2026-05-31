@@ -24,7 +24,7 @@ from typing import Iterable
 import numpy as np
 import torch
 from huggingface_hub import hf_hub_download
-from huggingface_hub.errors import GatedRepoError, HfHubHTTPError
+from huggingface_hub.errors import GatedRepoError, HfHubHTTPError, LocalEntryNotFoundError
 from pyannote.audio import Pipeline
 from pyannote.audio.pipelines import SpeakerDiarization
 from scipy.ndimage import binary_dilation
@@ -67,6 +67,19 @@ def get_hf_token() -> str:
     return token
 
 
+def _is_hf_access_error(exc: BaseException) -> bool:
+    """True when Hugging Face rejected the token or model terms were not accepted."""
+    if isinstance(exc, GatedRepoError):
+        return True
+    if isinstance(exc, HfHubHTTPError) and exc.response.status_code in {401, 403}:
+        return True
+    if isinstance(exc, LocalEntryNotFoundError):
+        message = str(exc).lower()
+        if any(keyword in message for keyword in ("403", "forbidden", "gated", "cannot access")):
+            return True
+    return False
+
+
 def verify_diarization_access(token: str | None = None) -> list[str]:
     token = token or get_hf_token()
     missing: list[str] = []
@@ -74,10 +87,8 @@ def verify_diarization_access(token: str | None = None) -> list[str]:
     for repo_id, filename in REQUIRED_HF_REPOS:
         try:
             hf_hub_download(repo_id, filename, token=token)
-        except GatedRepoError:
-            missing.append(f"https://huggingface.co/{repo_id}")
-        except HfHubHTTPError as exc:
-            if exc.response.status_code in {401, 403}:
+        except Exception as exc:
+            if _is_hf_access_error(exc):
                 missing.append(f"https://huggingface.co/{repo_id}")
             else:
                 raise
@@ -88,11 +99,15 @@ def verify_diarization_access(token: str | None = None) -> list[str]:
 def format_missing_access_message(missing_urls: Iterable[str]) -> str:
     urls = "\n".join(f"  - {url}" for url in missing_urls)
     return (
-        "Missing Hugging Face model access for speaker diarization.\n"
-        "Open each link below, click 'Agree and access repository', then rerun:\n"
-        f"{urls}\n"
-        "Also make sure HF_TOKEN is set in the same terminal:\n"
-        "  set HF_TOKEN=hf_..."
+        "Missing Hugging Face model access for speaker diarization.\n\n"
+        "1) Accept each model (same HF account as your token):\n"
+        f"{urls}\n\n"
+        "2) Token type: use a classic Read token, NOT a fine-grained token.\n"
+        "   Fine-grained tokens need 'Access public gated repositories' enabled,\n"
+        "   or you will get 403 Forbidden on pyannote models.\n"
+        "   Create token: https://huggingface.co/settings/tokens → New token → Read\n\n"
+        "3) Kaggle: Add-ons → Secrets → HF_TOKEN → Add to notebook → restart session.\n"
+        "   Local: set HF_TOKEN=hf_... in the same terminal before running step 02."
     )
 
 

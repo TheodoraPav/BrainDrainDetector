@@ -1,9 +1,9 @@
 """
 Step 3 — Preprocess physiological signals (E4 + NeuroSky EEG).
 
-For each participant:
-  1. Load E4 signals: EDA, HR, IBI from e4_data/{participant}/
-  2. Load NeuroSky EEG signals: theta, alpha, beta from neurosky_polar_data/{participant}/BrainWave.csv
+For each participant (E4 folders named 1, 2, ... → saved as P1, P2, ...):
+  1. Load E4 signals: EDA, HR, IBI from e4_data/e4_data/{id}/
+  2. Load NeuroSky EEG signals: theta, alpha, beta from neurosky_polar_data/neurosky_polar_data/{id}/BrainWave.csv
   3. Align all signals to the same fixed 5-second annotation grid used by audio preprocessing.
   4. Normalize each signal to zero mean and unit variance (z-score).
   5. Save each window as a tensor in data_processed/physio/.
@@ -33,9 +33,11 @@ def load_e4_signal(participant_dir: Path, signal_name: str) -> pd.DataFrame:
     """
     Loads one E4 CSV file.
     E4 CSV format: first row = Unix timestamp, second row = sample rate, rest = data values.
+    Some exports include a leading header row (e.g. 'timestamp') — that row is skipped.
     """
     filepath = participant_dir / f"E4_{signal_name}.csv"
     raw = pd.read_csv(filepath, header=None)
+    raw = _drop_leading_non_numeric_rows(raw)
 
     start_time  = float(raw.iloc[0, 0])
     sample_rate = float(raw.iloc[1, 0])
@@ -47,6 +49,20 @@ def load_e4_signal(participant_dir: Path, signal_name: str) -> pd.DataFrame:
     return pd.DataFrame({"timestamp": timestamps, signal_name: values})
 
 
+def _drop_leading_non_numeric_rows(raw: pd.DataFrame) -> pd.DataFrame:
+    """Removes header rows like 'timestamp' before parsing E4 numeric layout."""
+    start = 0
+    while start < len(raw):
+        try:
+            float(raw.iloc[start, 0])
+            break
+        except (TypeError, ValueError):
+            start += 1
+    if start >= len(raw):
+        raise ValueError("No numeric rows found in E4 CSV")
+    return raw.iloc[start:].reset_index(drop=True)
+
+
 def load_ibi(participant_dir: Path) -> pd.DataFrame:
     """
     IBI has a different format: rows are (time_since_start, ibi_value).
@@ -54,6 +70,7 @@ def load_ibi(participant_dir: Path) -> pd.DataFrame:
     """
     filepath = participant_dir / "E4_IBI.csv"
     raw = pd.read_csv(filepath, header=None)
+    raw = _drop_leading_non_numeric_rows(raw)
 
     start_time = float(raw.iloc[0, 0])
     data_rows  = raw.iloc[1:]
@@ -149,12 +166,22 @@ def main(cfg):
     output_dir     = Path(cfg.paths.data_processed) / "physio"
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    if not e4_dir.is_dir():
+        raise FileNotFoundError(f"E4 data directory not found: {e4_dir}")
+    if not neurosky_dir.is_dir():
+        raise FileNotFoundError(f"NeuroSky data directory not found: {neurosky_dir}")
+
     window_size_sec         = cfg.data.window_size_sec
     target_steps_per_window = 50  # 10 Hz internal grid per 5-second window
 
-    participant_dirs = sorted(e4_dir.iterdir(), key=lambda p: int(p.name))
+    participant_dirs = sorted(
+        (p for p in e4_dir.iterdir() if p.is_dir() and p.name.isdigit()),
+        key=lambda p: int(p.name),
+    )
     counts_by_participant: dict[str, int] = {}
     skipped_participants: list[str] = []
+    print(f"E4 dir:       {e4_dir}")
+    print(f"NeuroSky dir: {neurosky_dir}")
     print(f"Found {len(participant_dirs)} participant E4 folders.")
 
     for part_dir in participant_dirs:
@@ -186,9 +213,13 @@ def main(cfg):
             "HR":    (hr_df["timestamp"].values,  hr_df["HR"].values),
             "IBI":   (ibi_df["timestamp"].values, ibi_df["IBI"].values),
         }
+        if "timestamp" in eeg_df.columns:
+            eeg_timestamps = eeg_df["timestamp"].astype(float).values
+        else:
+            eeg_timestamps = eeg_df.index.values.astype(float)
         for eeg_col in ["theta", "alpha", "beta"]:
             if eeg_col in eeg_df.columns:
-                signal_dict[eeg_col] = (eeg_df.index.values.astype(float), eeg_df[eeg_col].values)
+                signal_dict[eeg_col] = (eeg_timestamps, eeg_df[eeg_col].values)
 
         windows = extract_windows(signal_dict, window_size_sec, target_steps_per_window)
         counts_by_participant[participant_id] = len(windows)
@@ -217,6 +248,14 @@ def main(cfg):
     if skipped_participants:
         log_stats("03", {"skipped": ",".join(skipped_participants)})
     log_participant_counts("03", counts_by_participant)
+
+    if total_windows == 0:
+        raise RuntimeError(
+            f"Step 03 produced 0 physio windows. "
+            f"E4 folders found: {len(participant_dirs)}, skipped: {len(skipped_participants)}. "
+            f"Check that {e4_dir} and {neurosky_dir} contain participant data on this machine."
+        )
+
     stage_ok("03", f"saved {total_windows} physio windows for {len(counts_by_participant)} participants")
 
 

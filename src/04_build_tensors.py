@@ -141,6 +141,15 @@ def main(cfg):
     if offline_aug_enabled:
         log_stats("04", {"output_aug_dir": str(aug_output_dir)})
     log_participant_counts("04", dict(counts_by_participant))
+
+    if saved_count == 0:
+        raise RuntimeError(
+            f"Step 04 saved 0 windows. "
+            f"audio={len(audio_index)} physio={len(physio_index)} labels={len(labels_df)} "
+            f"skipped={skipped_count}. "
+            "Re-run step 03 (physio) — physio_files_indexed=0 means no physio tensors were built."
+        )
+
     stage_ok("04", f"saved {saved_count} joined windows ({skipped_count} skipped)")
 
 
