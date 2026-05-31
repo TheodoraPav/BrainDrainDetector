@@ -35,6 +35,7 @@ Usage:
 
 
 import argparse
+import gc
 
 import numpy as np
 
@@ -56,6 +57,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 
 
+from models.audio_encoder import AudioEncoder, load_wav2vec2_backbone
 from models.classifier import BrainDrainDetector
 
 from data.dataset import (
@@ -170,6 +172,8 @@ def train_one_fold(
 
     device: torch.device,
 
+    shared_audio_encoder: AudioEncoder | None = None,
+
 ) -> dict:
 
     """Trains and evaluates the model for one LOSO fold."""
@@ -221,7 +225,10 @@ def train_one_fold(
 
 
 
-    model     = BrainDrainDetector(dict(cfg.model)).to(device)
+    model     = BrainDrainDetector(
+        dict(cfg.model),
+        shared_audio_encoder=shared_audio_encoder,
+    ).to(device)
 
     criterion = nn.CrossEntropyLoss()
 
@@ -442,7 +449,16 @@ def main(cfg):
 
     print(f"Running LOSO cross-validation over {len(participant_ids)} participants.")
 
-
+    shared_audio_encoder = None
+    if cfg.model.get("audio_encoder", "wav2vec2") == "wav2vec2":
+        print("Loading Wav2Vec2 audio backbone once (shared across all folds)...")
+        wav2vec2_backbone = load_wav2vec2_backbone()
+        shared_audio_encoder = AudioEncoder(
+            backend="wav2vec2",
+            freeze_backbone=cfg.model.get("freeze_audio_backbone", True),
+            wav2vec2_backbone=wav2vec2_backbone,
+        ).to(device)
+        print("Wav2Vec2 backbone ready.")
 
     all_fold_metrics = []
 
@@ -460,11 +476,16 @@ def main(cfg):
 
         fold_metrics = train_one_fold(
 
-            train_samples, test_samples, test_participant, cfg, device
+            train_samples, test_samples, test_participant, cfg, device,
+            shared_audio_encoder=shared_audio_encoder,
 
         )
 
         all_fold_metrics.append(fold_metrics)
+
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
 
 

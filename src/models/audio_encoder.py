@@ -12,9 +12,25 @@ fixed during training. Only the biosignal encoder, fusion layer, and
 classification head receive gradient updates.
 """
 
+import os
+
 import torch
 import torch.nn as nn
 from transformers import Wav2Vec2Model
+
+_WAV2VEC2_BACKBONE: Wav2Vec2Model | None = None
+
+
+def load_wav2vec2_backbone() -> Wav2Vec2Model:
+    """Load Wav2Vec2 once per process (shared across LOSO folds)."""
+    global _WAV2VEC2_BACKBONE
+    if _WAV2VEC2_BACKBONE is None:
+        os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+        _WAV2VEC2_BACKBONE = Wav2Vec2Model.from_pretrained(
+            "facebook/wav2vec2-base",
+            low_cpu_mem_usage=True,
+        )
+    return _WAV2VEC2_BACKBONE
 
 
 def _freeze_module(module: nn.Module) -> None:
@@ -26,9 +42,9 @@ def _freeze_module(module: nn.Module) -> None:
 class Wav2Vec2Encoder(nn.Module):
     """Wraps pretrained Wav2Vec2 and adds a mean-pooling step."""
 
-    def __init__(self, freeze_backbone: bool = True):
+    def __init__(self, freeze_backbone: bool = True, backbone: Wav2Vec2Model | None = None):
         super().__init__()
-        self.backbone = Wav2Vec2Model.from_pretrained("facebook/wav2vec2-base")
+        self.backbone = backbone if backbone is not None else load_wav2vec2_backbone()
         self.embedding_dim = 768  # wav2vec2-base hidden size
         self.freeze_backbone = freeze_backbone
         if freeze_backbone:
@@ -113,10 +129,18 @@ class AudioEncoder(nn.Module):
     Both backends output shape (batch, embedding_dim).
     """
 
-    def __init__(self, backend: str = "wav2vec2", freeze_backbone: bool = True):
+    def __init__(
+        self,
+        backend: str = "wav2vec2",
+        freeze_backbone: bool = True,
+        wav2vec2_backbone: Wav2Vec2Model | None = None,
+    ):
         super().__init__()
         if backend == "wav2vec2":
-            self.encoder = Wav2Vec2Encoder(freeze_backbone=freeze_backbone)
+            self.encoder = Wav2Vec2Encoder(
+                freeze_backbone=freeze_backbone,
+                backbone=wav2vec2_backbone,
+            )
         elif backend == "resnet18":
             if freeze_backbone:
                 raise ValueError(

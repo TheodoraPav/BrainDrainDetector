@@ -33,19 +33,23 @@ DEFAULT_FUSION_MODE = "cross_attn_pooled"
 
 class BrainDrainDetector(nn.Module):
 
-    def __init__(self, cfg: dict):
+    def __init__(self, cfg: dict, shared_audio_encoder: AudioEncoder | None = None):
         """
         Args:
             cfg: the 'model' section of the YAML config as a plain dict.
+            shared_audio_encoder: optional pre-loaded AudioEncoder (reused across LOSO folds).
         """
         super().__init__()
 
         self.fusion_mode = cfg.get("fusion_mode", DEFAULT_FUSION_MODE)
 
-        self.audio_encoder = AudioEncoder(
-            backend=cfg["audio_encoder"],
-            freeze_backbone=cfg.get("freeze_audio_backbone", True),
-        )
+        if shared_audio_encoder is not None:
+            self.audio_encoder = shared_audio_encoder
+        else:
+            self.audio_encoder = AudioEncoder(
+                backend=cfg["audio_encoder"],
+                freeze_backbone=cfg.get("freeze_audio_backbone", True),
+            )
 
         num_signals = len(cfg.get("e4_signals",  ["EDA", "HR", "IBI"])) + \
                       len(cfg.get("eeg_signals", ["theta", "alpha", "beta"]))
