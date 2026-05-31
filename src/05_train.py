@@ -36,6 +36,7 @@ Usage:
 
 import argparse
 import gc
+import os
 
 import numpy as np
 
@@ -407,11 +408,23 @@ def train_one_fold(
 
 
 
+def _configure_cuda_backend() -> None:
+    """Avoid cuDNN RNN kernels when the runtime/GPU combo rejects them (common on Kaggle)."""
+    if not torch.cuda.is_available():
+        return
+    disable = os.environ.get("BRAIN_DRAIN_DISABLE_CUDNN", "").lower() in ("1", "true", "yes")
+    if disable:
+        torch.backends.cudnn.enabled = False
+        print("cuDNN disabled for training (BRAIN_DRAIN_DISABLE_CUDNN=1)")
+
+
 def main(cfg):
 
     stage_start("05", "LOSO training")
 
     torch.manual_seed(cfg.training.seed)
+
+    _configure_cuda_backend()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
