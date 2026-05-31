@@ -405,17 +405,92 @@ def train_one_fold(
     return final_metrics
 
 
+def _save_loso_results(cfg, all_fold_metrics: list) -> Path:
+    summary = average_metrics_across_folds(all_fold_metrics)
 
+    print(f"\n{'='*60}")
+    print("LOSO Summary:")
+    for key, value in summary.items():
+        print(f"  {key}: {value}")
+
+    results_path = Path(cfg.paths.data_processed) / "loso_results.pt"
+    torch.save({"fold_metrics": all_fold_metrics, "summary": summary}, results_path)
+
+    log_stats("05", {
+        "folds_completed": len(all_fold_metrics),
+        "results_file": str(results_path),
+        **{f"summary_{key}": round(value, 4) if isinstance(value, float) else value for key, value in summary.items()},
+    })
+    stage_ok("05", f"LOSO complete — {len(all_fold_metrics)} folds, results in {results_path}")
+    print(f"\nResults saved to {results_path}")
+    return results_path
+
+
+def _evaluate_fold_checkpoint(
+    test_participant: str,
+    test_samples: list,
+    cfg,
+    device: torch.device,
+    shared_audio_encoder: AudioEncoder | None,
+) -> dict:
+    ckpt_path = Path(cfg.paths.checkpoints) / f"best_{test_participant}.pt"
+    model = BrainDrainDetector(
+        dict(cfg.model),
+        shared_audio_encoder=shared_audio_encoder,
+    ).to(device)
+    model.load_state_dict(torch.load(ckpt_path, weights_only=True))
+    test_loader = DataLoader(
+        BrainDrainDataset(test_samples),
+        batch_size=cfg.training.batch_size,
+        shuffle=False,
+        num_workers=0,
+    )
+    criterion = nn.CrossEntropyLoss()
+    _, labels, preds = run_one_epoch(model, test_loader, criterion, None, device, is_training=False)
+    metrics = compute_metrics(labels, preds)
+    metrics["participant"] = test_participant
+    return metrics
+
+
+def recover_loso_from_checkpoints(
+    cfg,
+    device: torch.device,
+    samples: list,
+    participant_ids: list,
+    shared_audio_encoder: AudioEncoder | None = None,
+) -> list | None:
+    """Rebuild loso_results.pt from saved checkpoints — no retraining."""
+    checkpoints_dir = Path(cfg.paths.checkpoints)
+    missing = [p for p in participant_ids if not (checkpoints_dir / f"best_{p}.pt").is_file()]
+    if missing:
+        print(f"Checkpoints: {len(participant_ids) - len(missing)}/{len(participant_ids)} found.")
+        print(f"Missing: {missing[:5]}{'...' if len(missing) > 5 else ''}")
+        return None
+
+    print(f"All {len(participant_ids)} checkpoints found — recovering results (no retraining).")
+    all_fold_metrics = []
+    for test_participant in participant_ids:
+        _, test_samples = build_loso_splits(samples, test_participant)
+        metrics = _evaluate_fold_checkpoint(
+            test_participant, test_samples, cfg, device, shared_audio_encoder,
+        )
+        all_fold_metrics.append(metrics)
+        print(f"  {test_participant}: macro_f1={metrics['macro_f1']}")
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+    return all_fold_metrics
 
 
 def _configure_cuda_backend() -> None:
-    """Avoid cuDNN RNN kernels when the runtime/GPU combo rejects them (common on Kaggle)."""
+    """Kaggle PyTorch builds often reject cuDNN BiGRU kernels — use native GRU instead."""
     if not torch.cuda.is_available():
         return
-    disable = os.environ.get("BRAIN_DRAIN_DISABLE_CUDNN", "").lower() in ("1", "true", "yes")
-    if disable:
+    on_kaggle = Path("/kaggle").exists()
+    if on_kaggle or os.environ.get("BRAIN_DRAIN_DISABLE_CUDNN", "").lower() in ("1", "true", "yes"):
         torch.backends.cudnn.enabled = False
-        print("cuDNN disabled for training (BRAIN_DRAIN_DISABLE_CUDNN=1)")
+        if on_kaggle:
+            print("Kaggle: cuDNN disabled (BiGRU compatibility)")
 
 
 def main(cfg):
@@ -462,6 +537,15 @@ def main(cfg):
 
     print(f"Running LOSO cross-validation over {len(participant_ids)} participants.")
 
+    results_path = Path(cfg.paths.data_processed) / "loso_results.pt"
+    if results_path.is_file():
+        data = torch.load(results_path, weights_only=False)
+        print(f"LOSO results already exist: {results_path}")
+        for key, value in data["summary"].items():
+            print(f"  {key}: {value}")
+        stage_ok("05", f"skipped — results already at {results_path}")
+        return
+
     shared_audio_encoder = None
     if cfg.model.get("audio_encoder", "wav2vec2") == "wav2vec2":
         print("Loading Wav2Vec2 audio backbone once (shared across all folds)...")
@@ -472,6 +556,13 @@ def main(cfg):
             wav2vec2_backbone=wav2vec2_backbone,
         ).to(device)
         print("Wav2Vec2 backbone ready.")
+
+    recovered = recover_loso_from_checkpoints(
+        cfg, device, samples, participant_ids, shared_audio_encoder,
+    )
+    if recovered is not None:
+        _save_loso_results(cfg, recovered)
+        return
 
     all_fold_metrics = []
 
@@ -500,36 +591,7 @@ def main(cfg):
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
-
-
-    summary = average_metrics_across_folds(all_fold_metrics)
-
-    print(f"\n{'='*60}")
-
-    print("LOSO Summary:")
-
-    for key, value in summary.items():
-
-        print(f"  {key}: {value}")
-
-
-
-    results_path = Path(cfg.paths.data_processed) / "loso_results.pt"
-
-    torch.save({"fold_metrics": all_fold_metrics, "summary": summary}, results_path)
-
-    log_stats("05", {
-        "folds_completed": len(all_fold_metrics),
-        "results_file": str(results_path),
-        **{f"summary_{key}": round(value, 4) if isinstance(value, float) else value for key, value in summary.items()},
-    })
-
-    stage_ok("05", f"LOSO complete — {len(all_fold_metrics)} folds, results in {results_path}")
-
-    print(f"\nResults saved to {results_path}")
-
-
-
+    _save_loso_results(cfg, all_fold_metrics)
 
 
 if __name__ == "__main__":

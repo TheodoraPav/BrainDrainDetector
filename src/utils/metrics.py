@@ -48,20 +48,22 @@ def print_classification_report(true_labels: List[int], predicted_labels: List[i
     print(report)
 
 
-def average_metrics_across_folds(fold_metrics: List[Dict[str, float]]) -> Dict[str, float]:
+def average_metrics_across_folds(fold_metrics: List[Dict]) -> Dict[str, float]:
     """
     Averages metric dicts from multiple LOSO folds into a single summary dict.
 
-    Args:
-        fold_metrics: list of metric dicts, one per fold
-
-    Returns:
-        dict with mean and std for each metric key
+    Skips non-numeric keys (e.g. participant ID strings).
     """
-    all_keys = fold_metrics[0].keys()
+    if not fold_metrics:
+        return {}
+
+    numeric_keys = [
+        key for key in fold_metrics[0].keys()
+        if all(isinstance(m.get(key), (int, float, np.number)) for m in fold_metrics)
+    ]
     summary = {}
-    for key in all_keys:
-        values = [m[key] for m in fold_metrics]
+    for key in numeric_keys:
+        values = [float(m[key]) for m in fold_metrics]
         summary[f"{key}_mean"] = round(float(np.mean(values)), 4)
-        summary[f"{key}_std"]  = round(float(np.std(values)), 4)
+        summary[f"{key}_std"] = round(float(np.std(values)), 4)
     return summary
