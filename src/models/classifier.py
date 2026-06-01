@@ -5,16 +5,8 @@ Wires AudioEncoder + BiosignalEncoder + fusion layer + task head(s)
 into a single nn.Module.
 
 Task modes (set via cfg["task_mode"]):
-  "classification"  — single nn.Linear(project_dim, num_classes) head.
-                      forward() returns logits of shape (batch, num_classes).
-                      Use nn.CrossEntropyLoss() on the output.
-
-  "regression_va"   — two independent heads:
-                        head_arousal: nn.Linear(project_dim, 1)
-                        head_valence: nn.Linear(project_dim, 1)
-                      forward() returns (batch, 2) FloatTensor [arousal, valence].
-                      Each head maps the shared fused representation to one
-                      continuous output in the native annotation scale (1-5).
+  "classification"  — nn.Linear(project_dim, 2) head (Safe / Alarm).
+  "regression_va"   — two independent Linear heads for arousal and valence.
 
 Fusion mode (set via cfg["fusion_mode"]):
   "cross_attn_pooled"   — audio (1 token) attends over pooled biosignal token.

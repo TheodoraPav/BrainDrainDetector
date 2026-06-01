@@ -4,9 +4,8 @@
 # Trains two heads (arousal + valence) on the native K-EmoCon
 # annotation values (1-5 Likert scale).
 #
-# After each fold the derived 3-class (va_only rules) and binary
-# alarm metrics are computed and reported alongside the native
-# CCC / MAE metrics.
+# After each fold the derived binary alarm metrics are computed and reported
+# alongside the native CCC / MAE metrics.
 # ============================================================
 defaults:
   - base

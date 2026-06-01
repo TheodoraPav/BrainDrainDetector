@@ -7,7 +7,7 @@ Saves one complete .pt file per window to data_processed/windows/.
 Each saved dict contains:
   - waveform:    (audio_samples,) float32
   - biosignals:  (time_steps, 6)  float32
-  - label:       int               3-class operational label
+  - label:       int               binary label (0=Safe, 1=Alarm)
   - participant: str
   - arousal:     int               raw self-report arousal (1-5)
   - valence:     int               raw self-report valence (1-5)
@@ -156,9 +156,8 @@ def main(cfg):
         "physio_files_indexed":        len(physio_index),
         "label_rows_total":            len(source_df),
         "windows_per_participant":     format_count_summary(counts_by_participant.values()),
-        "class_0_optimal":             label_counts.get(0, 0),
-        "class_1_overloaded":          label_counts.get(1, 0),
-        "class_2_grey":                label_counts.get(2, 0),
+        "label_safe":  label_counts.get(0, 0),
+        "label_alarm": label_counts.get(1, 0),
         "offline_augmentation":        offline_aug_enabled,
         "arousal_valence_stored":      use_annotations,
         "output_dir":                  str(output_dir),

@@ -5,7 +5,7 @@ Each sample is one 5-second window from one participant and contains:
   - waveform   : (audio_samples,)       float32 tensor  (or cached embedding)
   - biosignals : (time_steps, 6)        float32 tensor  [EDA, HR, IBI, theta, alpha, beta]
   - target     : depends on task_mode —
-      classification:  int               0=Optimal, 1=Overloaded, 2=GreyZone
+      classification:  int  0=Safe, 1=Alarm
       regression_va:   FloatTensor (2,)  [arousal, valence] in [1, 5]
   - participant: str                    participant ID (used for LOSO splits)
 
@@ -25,6 +25,7 @@ from .splits import (
     build_train_val_window_split,
     pick_validation_participant,
 )
+from utils.labels import merge_to_binary
 
 
 class BrainDrainDataset(Dataset):
@@ -34,8 +35,8 @@ class BrainDrainDataset(Dataset):
         Args:
             samples:   list of dicts, each with keys waveform/audio_embedding,
                        biosignals, label, participant (and optionally arousal, valence)
-            task_mode: "classification" — returns integer label as target
-                       "regression_va" — returns FloatTensor([arousal, valence]) as target
+            task_mode: "classification" — returns Safe (0) / Alarm (1)
+                       "regression_va" — returns FloatTensor([arousal, valence])
         """
         self.samples   = samples
         self.task_mode = task_mode
@@ -71,7 +72,7 @@ class BrainDrainDataset(Dataset):
                 dtype=torch.float32,
             )
         else:
-            target = sample["label"]
+            target = merge_to_binary(int(sample["label"]))
 
         return audio_input, biosignals, target
 
@@ -191,8 +192,7 @@ def summarize_balanced_epoch(
         "draws_per_participant_min":    min(draw_values) if draw_values else 0,
         "draws_per_participant_median": int(np.median(draw_values)) if draw_values else 0,
         "draws_per_participant_max":    max(draw_values) if draw_values else 0,
-        "label_0_optimal":    label_counts.get(0, 0),
-        "label_1_overloaded": label_counts.get(1, 0),
-        "label_2_grey":       label_counts.get(2, 0),
+        "label_safe":  label_counts.get(0, 0),
+        "label_alarm": label_counts.get(1, 0),
         "draws_by_participant": draws,
     }

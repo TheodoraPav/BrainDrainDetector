@@ -2,7 +2,8 @@
 Step 2 — Preprocess audio.
 
 For each stereo debate WAV file (e.g. p1.p2.wav):
-  1. Diarize the mono mix and separate speakers (mute the other speaker).
+  1. Diarize the mono mix and separate speakers (mute the other speaker),
+     OR load cached segments.csv from a previous run (skips pyannote).
   2. Run Voice Activity Detection (VAD) once on each separated mono track.
   3. Walk the fixed 5-second annotation grid (0-5, 5-10, 10-15, ...).
   4. Keep windows whose overlap with the global speech timeline is large enough.
@@ -42,7 +43,13 @@ from omegaconf import OmegaConf
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from utils.diarization import load_diarization_pipeline, parse_participants, separate_stereo_speakers
+from utils.diarization import (
+    load_cached_segments,
+    load_diarization_pipeline,
+    parse_participants,
+    separate_stereo_from_cached_segments,
+    separate_stereo_speakers,
+)
 from utils.pipeline_log import format_count_summary, log_participant_counts, log_stats, stage_ok, stage_start
 from utils.vad import (
     detect_speech_segments,
@@ -207,16 +214,15 @@ def main(cfg, testing: bool = False) -> None:
     summary_rows: list[dict] = []
     counts_by_participant: dict[str, int] = defaultdict(int)
     debates_processed = 0
+    debates_from_cache = 0
 
-    print("Loading diarization pipeline...")
-    diarization_pipeline = load_diarization_pipeline()
-    print("Loading VAD pipeline...")
+    diarization_pipeline = None
     vad_pipeline = load_vad_pipeline()
 
     wav_files = sorted(audio_dir.glob("p*.wav"))
     print(f"Found {len(wav_files)} stereo audio files.")
     print(
-        "Pipeline: diarization -> VAD -> 5s windows | "
+        "Pipeline: diarization (cached or live) -> VAD -> 5s windows | "
         f"keep when overlap >= {min_overlap_sec}s OR >= {min_overlap_pct:.0%}"
     )
     if testing:
@@ -231,32 +237,52 @@ def main(cfg, testing: bool = False) -> None:
 
         print(f"\nProcessing {wav_path.name}: {participant_left} (left), {participant_right} (right)")
 
-        diarized = separate_stereo_speakers(
-            left=left_np,
-            right=right_np,
-            sample_rate=file_sample_rate,
-            pipeline=diarization_pipeline,
-            participant_left=participant_left,
-            participant_right=participant_right,
-            uri=wav_path.stem,
-            dilate_ms=dilate_ms,
-            min_gap_sec=min_gap_sec,
-        )
-        print_diarization_assignment(diarized)
-
         debate_diar_dir = diarization_dir / wav_path.stem
-        write_csv(
-            [{**row, "source_file": wav_path.name} for row in diarized.segments],
-            debate_diar_dir / "segments.csv",
-            fieldnames=[
-                "source_file",
-                "diarized_speaker",
-                "assigned_participant",
-                "start_sec",
-                "end_sec",
-                "duration_sec",
-            ],
-        )
+        segments_csv = debate_diar_dir / "segments.csv"
+
+        if segments_csv.is_file():
+            print(f"  Using cached diarization: {segments_csv}")
+            cached_segments = load_cached_segments(segments_csv)
+            diarized = separate_stereo_from_cached_segments(
+                left=left_np,
+                right=right_np,
+                sample_rate=file_sample_rate,
+                segments=cached_segments,
+                participant_left=participant_left,
+                participant_right=participant_right,
+                dilate_ms=dilate_ms,
+                min_gap_sec=min_gap_sec,
+            )
+            debates_from_cache += 1
+        else:
+            if diarization_pipeline is None:
+                print("Loading diarization pipeline...")
+                diarization_pipeline = load_diarization_pipeline()
+            diarized = separate_stereo_speakers(
+                left=left_np,
+                right=right_np,
+                sample_rate=file_sample_rate,
+                pipeline=diarization_pipeline,
+                participant_left=participant_left,
+                participant_right=participant_right,
+                uri=wav_path.stem,
+                dilate_ms=dilate_ms,
+                min_gap_sec=min_gap_sec,
+            )
+            write_csv(
+                [{**row, "source_file": wav_path.name} for row in diarized.segments],
+                segments_csv,
+                fieldnames=[
+                    "source_file",
+                    "diarized_speaker",
+                    "assigned_participant",
+                    "start_sec",
+                    "end_sec",
+                    "duration_sec",
+                ],
+            )
+
+        print_diarization_assignment(diarized)
 
         if testing:
             sf.write(str(debate_diar_dir / f"{participant_left}_diarized.wav"), diarized.left_track, file_sample_rate)
@@ -307,6 +333,7 @@ def main(cfg, testing: bool = False) -> None:
     total_windows = sum(counts_by_participant.values())
     log_stats("02", {
         "debates_processed": debates_processed,
+        "debates_from_cached_diarization": debates_from_cache,
         "participants_with_audio": len(counts_by_participant),
         "total_windows": total_windows,
         "windows_per_participant": format_count_summary(counts_by_participant.values()),

@@ -1,23 +1,19 @@
 """
 Plotting utilities for BrainDrainDetector.
 
-All functions save figures to the figures/ directory and return the file path.
+Classification (Safe vs Alarm):
+  plot_confusion_matrix      2x2 normalized confusion matrix
+  plot_roc_curve             binary ROC (Alarm class)
+  plot_f1_comparison         grouped bar chart comparing F1 Alarm across experiments
+  plot_loso_summary_bars     bar chart of mean LOSO binary metrics
 
-Classification:
-  plot_confusion_matrix      3x3 heatmap of predicted vs true 3-class labels
-  plot_f1_comparison         grouped bar chart comparing F1 across experiments
-  plot_roc_curves            one-vs-rest ROC curves for each class
-  plot_loso_summary_bars     bar chart of mean LOSO metrics from a summary dict
-
-Regression VA (new):
+Regression VA:
   plot_va_scatter            scatter true vs pred for arousal or valence
   plot_va_metrics_bars       CCC and MAE bars for both dimensions
-  plot_binary_alarm_confusion 2x2 confusion matrix after Safe/Alarm merge
 
 Explainability:
-  plot_attention_map         heatmap of Cross-Attention weights (pooled fusion: 1x1 per head)
+  plot_attention_map         heatmap of Cross-Attention weights (pooled fusion)
   plot_attention_over_time   heatmap and line plot over biosignal time steps
-                             (used by the sequence_cross_attn fusion)
 """
 
 import numpy as np
@@ -26,9 +22,6 @@ import seaborn as sns
 from pathlib import Path
 from sklearn.metrics import confusion_matrix, roc_curve, auc
 from typing import List, Dict
-
-
-CLASS_NAMES = ["Optimal", "Overloaded", "Grey Zone"]
 
 
 def _ensure_figures_dir(figures_dir: str) -> Path:
@@ -43,17 +36,19 @@ def plot_confusion_matrix(
     figures_dir: str,
     filename: str = "confusion_matrix.png",
 ) -> str:
-    cm = confusion_matrix(true_labels, predicted_labels, labels=[0, 1, 2])
-    cm_normalized = cm.astype(float) / cm.sum(axis=1, keepdims=True)
+    """2x2 normalized confusion matrix for Safe vs Alarm."""
+    cm = confusion_matrix(true_labels, predicted_labels, labels=[0, 1])
+    row_sums = cm.sum(axis=1, keepdims=True)
+    cm_norm  = cm.astype(float) / np.maximum(row_sums, 1)
 
-    fig, ax = plt.subplots(figsize=(6, 5))
+    fig, ax = plt.subplots(figsize=(4, 4))
     sns.heatmap(
-        cm_normalized,
+        cm_norm,
         annot=True,
         fmt=".2f",
         cmap="Blues",
-        xticklabels=CLASS_NAMES,
-        yticklabels=CLASS_NAMES,
+        xticklabels=["Safe", "Alarm"],
+        yticklabels=["Safe", "Alarm"],
         ax=ax,
     )
     ax.set_xlabel("Predicted")
@@ -72,20 +67,16 @@ def plot_f1_comparison(
     figures_dir: str,
     filename: str = "f1_comparison.png",
 ) -> str:
-    """
-    Args:
-        experiment_results: dict mapping experiment name to its metrics dict.
-                            e.g. {"Baseline": {"macro_f1_mean": 0.55, ...}, ...}
-    """
+    """Grouped bar chart of F1 Alarm across experiments."""
     experiment_names = list(experiment_results.keys())
-    f1_means = [experiment_results[name]["macro_f1_mean"] for name in experiment_names]
-    f1_stds  = [experiment_results[name]["macro_f1_std"]  for name in experiment_names]
+    f1_means = [experiment_results[name].get("f1_alarm_mean", 0.0) for name in experiment_names]
+    f1_stds  = [experiment_results[name].get("f1_alarm_std", 0.0) for name in experiment_names]
 
     fig, ax = plt.subplots(figsize=(7, 4))
     bars = ax.bar(experiment_names, f1_means, yerr=f1_stds, capsize=5, color=["#4C72B0", "#DD8452", "#55A868"])
     ax.set_ylim(0, 1.0)
-    ax.set_ylabel("Macro F1 Score")
-    ax.set_title("Macro F1 Comparison Across Experiments (LOSO mean ± std)")
+    ax.set_ylabel("F1 Alarm Score")
+    ax.set_title("F1 Alarm Comparison Across Experiments (LOSO mean ± std)")
 
     for bar, mean in zip(bars, f1_means):
         ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01, f"{mean:.3f}", ha="center", fontsize=9)
@@ -102,12 +93,12 @@ def plot_loso_summary_bars(
     figures_dir: str,
     filename: str = "loso_metrics_summary.png",
 ) -> str:
-    """Bar chart of LOSO mean metrics from loso_results.pt summary (no raw preds needed)."""
+    """Bar chart of LOSO mean binary metrics from loso_results.pt summary."""
     series = [
-        ("macro_f1_mean", "macro_f1_std", "Macro F1"),
-        ("recall_class0_mean", "recall_class0_std", "Recall Optimal"),
-        ("recall_class1_mean", "recall_class1_std", "Recall Overloaded"),
-        ("recall_class2_mean", "recall_class2_std", "Recall Grey Zone"),
+        ("recall_alarm_mean", "recall_alarm_std", "Recall Alarm"),
+        ("f1_alarm_mean", "f1_alarm_std", "F1 Alarm"),
+        ("balanced_accuracy_alarm_mean", "balanced_accuracy_alarm_std", "Balanced Acc"),
+        ("accuracy_alarm_mean", "accuracy_alarm_std", "Accuracy"),
     ]
     labels, means, stds = [], [], []
     for mean_key, std_key, label in series:
@@ -120,6 +111,9 @@ def plot_loso_summary_bars(
         means.append(float(val))
         stds.append(float(summary.get(std_key, 0.0)))
 
+    if not labels:
+        return ""
+
     fig, ax = plt.subplots(figsize=(8, 4))
     x = np.arange(len(labels))
     ax.bar(x, means, yerr=stds, capsize=4, color=["#4C72B0", "#55A868", "#DD8452", "#C44E52"][: len(labels)])
@@ -127,7 +121,7 @@ def plot_loso_summary_bars(
     ax.set_xticklabels(labels, rotation=15, ha="right")
     ax.set_ylim(0, 1.0)
     ax.set_ylabel("Score (LOSO mean ± std)")
-    ax.set_title("Baseline LOSO metrics")
+    ax.set_title("LOSO metrics — Safe vs Alarm")
     for i, m in enumerate(means):
         ax.text(i, m + 0.02, f"{m:.3f}", ha="center", fontsize=9)
     plt.tight_layout()
@@ -138,32 +132,27 @@ def plot_loso_summary_bars(
     return str(save_path)
 
 
-def plot_roc_curves(
-    true_labels: List[int],
-    predicted_probs: np.ndarray,
+def plot_roc_curve(
+    true_binary: List[int],
+    predicted_alarm_probs: List[float],
     figures_dir: str,
-    filename: str = "roc_curves.png",
+    filename: str = "roc_curve.png",
 ) -> str:
-    """
-    Args:
-        predicted_probs: (n_samples, 3) array of softmax probabilities
-    """
-    true_labels_array = np.array(true_labels)
+    """ROC curve for binary Safe vs Alarm classification."""
+    true_arr = np.array(true_binary)
+    pred_arr = np.array(predicted_alarm_probs)
+
+    fpr, tpr, _ = roc_curve(true_arr, pred_arr)
+    roc_auc = auc(fpr, tpr)
+
     fig, ax = plt.subplots(figsize=(6, 5))
-    colors = ["#4C72B0", "#DD8452", "#55A868"]
-
-    for class_idx, (class_name, color) in enumerate(zip(CLASS_NAMES, colors)):
-        binary_true = (true_labels_array == class_idx).astype(int)
-        class_probs = predicted_probs[:, class_idx]
-        fpr, tpr, _ = roc_curve(binary_true, class_probs)
-        roc_auc = auc(fpr, tpr)
-        ax.plot(fpr, tpr, color=color, label=f"{class_name} (AUC = {roc_auc:.2f})")
-
+    ax.plot(fpr, tpr, color="#e63946", linewidth=2, label=f"Alarm (AUC = {roc_auc:.4f})")
     ax.plot([0, 1], [0, 1], "k--", linewidth=0.8)
     ax.set_xlabel("False Positive Rate")
     ax.set_ylabel("True Positive Rate")
-    ax.set_title("ROC Curves (One vs Rest)")
+    ax.set_title("ROC Curve — Safe vs Alarm")
     ax.legend(loc="lower right")
+    ax.grid(True, linestyle=":", alpha=0.6)
     plt.tight_layout()
 
     save_path = _ensure_figures_dir(figures_dir) / filename
@@ -179,16 +168,7 @@ def plot_va_scatter(
     figures_dir: str,
     filename:   str | None = None,
 ) -> str:
-    """
-    Scatter plot of true vs predicted values for one VA dimension.
-
-    Args:
-        true_vals:  ground-truth arousal or valence values
-        pred_vals:  model predictions
-        dimension:  "Arousal" or "Valence" (used in title / filename)
-        figures_dir: output directory
-        filename:   optional override; defaults to va_scatter_{dimension.lower()}.png
-    """
+    """Scatter plot of true vs predicted values for one VA dimension."""
     if filename is None:
         filename = f"va_scatter_{dimension.lower()}.png"
 
@@ -218,13 +198,7 @@ def plot_va_metrics_bars(
     figures_dir: str,
     filename: str = "va_metrics_bars.png",
 ) -> str:
-    """
-    Bar chart comparing CCC and MAE for arousal vs valence (LOSO mean ± std).
-
-    Args:
-        summary: LOSO summary dict containing *_mean and *_std keys
-        figures_dir: output directory
-    """
+    """Bar chart comparing CCC and MAE for arousal vs valence (LOSO mean ± std)."""
     metrics = [
         ("ccc_arousal",  "CCC Arousal"),
         ("ccc_valence",  "CCC Valence"),
@@ -267,58 +241,13 @@ def plot_va_metrics_bars(
     return str(save_path)
 
 
-def plot_binary_alarm_confusion(
-    true_binary: List[int],
-    pred_binary: List[int],
-    figures_dir: str,
-    filename: str = "confusion_matrix_binary_alarm.png",
-) -> str:
-    """
-    2x2 normalized confusion matrix for the binary Safe / Alarm classification.
-
-    Args:
-        true_binary: ground-truth binary labels (0 = Safe, 1 = Alarm)
-        pred_binary: predicted binary labels
-        figures_dir: output directory
-    """
-    cm = confusion_matrix(true_binary, pred_binary, labels=[0, 1])
-    row_sums = cm.sum(axis=1, keepdims=True)
-    cm_norm  = cm.astype(float) / np.maximum(row_sums, 1)
-
-    fig, ax = plt.subplots(figsize=(4, 4))
-    sns.heatmap(
-        cm_norm,
-        annot=True,
-        fmt=".2f",
-        cmap="Blues",
-        xticklabels=["Safe", "Alarm"],
-        yticklabels=["Safe", "Alarm"],
-        ax=ax,
-    )
-    ax.set_xlabel("Predicted")
-    ax.set_ylabel("True")
-    ax.set_title("Alarm Confusion Matrix (normalized)")
-    plt.tight_layout()
-
-    save_path = _ensure_figures_dir(figures_dir) / filename
-    fig.savefig(save_path, dpi=150)
-    plt.close(fig)
-    return str(save_path)
-
-
 def plot_attention_map(
     attention_weights: np.ndarray,
     figures_dir: str,
     filename: str = "attention_map.png",
     title: str = "Cross-Attention Weights",
 ) -> str:
-    """
-    Visualizes the attention weights from the pooled CrossAttentionFusion layer.
-
-    Args:
-        attention_weights: (num_heads, query_len, key_len) numpy array.
-                           For cross_attn_pooled this is (num_heads, 1, 1).
-    """
+    """Visualizes attention weights from the pooled CrossAttentionFusion layer."""
     fig, axes = plt.subplots(1, attention_weights.shape[0], figsize=(3 * attention_weights.shape[0], 3))
     if attention_weights.shape[0] == 1:
         axes = [axes]
@@ -351,19 +280,7 @@ def plot_attention_over_time(
     title: str = "Sequence Cross-Attention Weights",
     time_axis_label: str = "Biosignal time step",
 ) -> str:
-    """
-    Visualizes the attention weights from the SequenceCrossAttentionFusion layer.
-
-    The audio is a single query token attending over T biosignal time steps,
-    so for each head the weights are a distribution over T values.
-
-    Two views are drawn side by side:
-      - Left  : heatmap of shape (num_heads, T). One row per attention head.
-      - Right : line plot, one curve per head, weight vs time step.
-
-    Args:
-        attention_weights: (num_heads, T) numpy array. Rows already sum to 1.
-    """
+    """Visualizes attention weights from the SequenceCrossAttentionFusion layer."""
     num_heads, time_steps = attention_weights.shape
 
     fig, (ax_heatmap, ax_lines) = plt.subplots(1, 2, figsize=(11, 3 + 0.3 * num_heads))
@@ -394,37 +311,6 @@ def plot_attention_over_time(
 
     fig.suptitle(title)
     plt.tight_layout()
-    save_path = _ensure_figures_dir(figures_dir) / filename
-    fig.savefig(save_path, dpi=150)
-    plt.close(fig)
-    return str(save_path)
-
-
-def plot_binary_roc_curve(
-    true_binary: List[int],
-    predicted_alarm_probs: List[float],
-    figures_dir: str,
-    filename: str = "roc_curve_binary_alarm.png",
-) -> str:
-    """
-    Plots a ROC curve for the binary Safe vs Alarm classification.
-    """
-    true_arr = np.array(true_binary)
-    pred_arr = np.array(predicted_alarm_probs)
-
-    fpr, tpr, _ = roc_curve(true_arr, pred_arr)
-    roc_auc = auc(fpr, tpr)
-
-    fig, ax = plt.subplots(figsize=(6, 5))
-    ax.plot(fpr, tpr, color="#e63946", linewidth=2, label=f"Binary Alarm (AUC = {roc_auc:.4f})")
-    ax.plot([0, 1], [0, 1], "k--", linewidth=0.8)
-    ax.set_xlabel("False Positive Rate")
-    ax.set_ylabel("True Positive Rate")
-    ax.set_title("ROC Curve — Binary Alarm (Safe vs Alarm)")
-    ax.legend(loc="lower right")
-    ax.grid(True, linestyle=":", alpha=0.6)
-    plt.tight_layout()
-
     save_path = _ensure_figures_dir(figures_dir) / filename
     fig.savefig(save_path, dpi=150)
     plt.close(fig)

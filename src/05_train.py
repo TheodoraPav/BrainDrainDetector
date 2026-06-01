@@ -9,10 +9,8 @@ For each participant:
     participant (never the LOSO test subject).
 
 Task modes (set via cfg.task.mode):
-  "classification"  — 3-class CE, early stopping on macro_f1.
-  "regression_va"   — predict Arousal + Valence, early stopping on ccc_mean.
-                      After each fold the derived 3-class and binary alarm
-                      metrics are computed for all three evaluation layers.
+  "classification" — 2-class Safe/Alarm CE, early stopping on recall_alarm.
+  "regression_va"  — predict Arousal + Valence, early stopping on ccc_mean.
 
 Usage:
     python src/05_train.py --config configs/exp_baseline.yaml
@@ -51,11 +49,12 @@ from data.dataset import (
     summarize_balanced_epoch,
 )
 from utils.metrics import (
-    compute_metrics,
     compute_va_metrics,
+    compute_binary_alarm_metrics,
     average_metrics_across_folds,
 )
-from utils.derived_eval import evaluate_derived_classification, evaluate_classification_binary
+from utils.labels import merge_to_binary
+from utils.derived_eval import evaluate_derived_binary_from_va
 from utils.early_stopping import early_stopping_should_stop, update_validation_score
 from utils.pipeline_log import format_count_summary, log_participant_counts, log_stats, stage_ok, stage_start
 
@@ -66,19 +65,26 @@ def _task_mode(cfg) -> str:
     return cfg.task.mode
 
 
+def _is_classification_task(task_mode: str) -> bool:
+    return task_mode == "classification"
+
+
 def _selection_metric(cfg) -> str:
-    return cfg.training.get("selection_metric", "macro_f1")
+    return cfg.training.get("selection_metric", "recall_alarm")
+
+
+def _build_model_cfg(cfg) -> dict:
+    """Merges model config with task_mode and sets num_classes per task."""
+    model_cfg = dict(cfg.model)
+    task_mode = _task_mode(cfg)
+    model_cfg["task_mode"] = task_mode
+    if task_mode == "classification":
+        model_cfg["num_classes"] = 2
+    return model_cfg
 
 
 def _training_use_amp(cfg, device: torch.device) -> bool:
     return device.type == "cuda" and bool(cfg.training.get("use_amp", False))
-
-
-def _build_model_cfg(cfg) -> dict:
-    """Merges model config with task_mode so the model can build the right head(s)."""
-    model_cfg = dict(cfg.model)
-    model_cfg["task_mode"] = _task_mode(cfg)
-    return model_cfg
 
 
 def _build_criterion(cfg, weights: torch.Tensor | None = None) -> nn.Module:
@@ -245,9 +251,8 @@ def _compute_epoch_score(all_labels, all_preds, task_mode: str, selection_metric
         va_m = compute_va_metrics(true_a, true_v, pred_a, pred_v)
         score = va_m.get(selection_metric, va_m["ccc_mean"])
         return 0.0 if (score is None or (isinstance(score, float) and score != score)) else float(score)
-    else:
-        m = compute_metrics(all_labels, all_preds)
-        return float(m.get(selection_metric, m["macro_f1"]))
+    m = compute_binary_alarm_metrics(all_labels, all_preds)
+    return float(m.get(selection_metric, m["recall_alarm"]))
 
 
 # ── Per-fold training ─────────────────────────────────────────────────────────
@@ -325,25 +330,22 @@ def train_one_fold(
         log_participant_counts("05", participant_counts, limit=0)
 
     class_weights = None
-    if task_mode == "classification" and cfg.training.get("weighted_loss", True):
-        # Calculate dynamic class weights based on fit_samples
-        class_counts = {0: 0, 1: 0, 2: 0}
+    if _is_classification_task(task_mode) and cfg.training.get("weighted_loss", True):
+        class_counts = {0: 0, 1: 0}
         for s in fit_samples:
-            lbl = s["label"]
+            lbl = merge_to_binary(int(s["label"]))
             class_counts[lbl] = class_counts.get(lbl, 0) + 1
+        num_classes = 2
+        class_names = {0: "Safe", 1: "Alarm"}
 
         total = len(fit_samples)
-        num_classes = 3
         weights = []
         print("  Dynamically calculated class weights (inverse frequency):")
         for c in range(num_classes):
             count = class_counts[c]
-            if count > 0:
-                w = total / (num_classes * count)
-            else:
-                w = 1.0
+            w = total / (num_classes * count) if count > 0 else 1.0
             weights.append(w)
-            print(f"    Class {c}: count={count}, weight={w:.4f}")
+            print(f"    {class_names[c]} ({c}): count={count}, weight={w:.4f}")
 
         class_weights = torch.tensor(weights, dtype=torch.float32).to(device)
 
@@ -492,24 +494,24 @@ def _build_fold_metrics(final_labels, final_preds, final_probs, participant, tas
             "pred_valence": pred_v,
         })
 
-        if cfg.task.get("derived_3class_eval", True):
-            true_labels_3class = [
+        if cfg.task.get("derived_binary_eval", True):
+            true_labels = [
                 s["label"]
                 for s in _get_test_samples_for_labels(participant, cfg)
             ]
-            if true_labels_3class:
-                derived = evaluate_derived_classification(pred_a, pred_v, true_labels_3class, cfg)
+            if true_labels:
+                derived = evaluate_derived_binary_from_va(pred_a, pred_v, true_labels, cfg)
                 base.update(derived)
     else:
-        l2 = compute_metrics(final_labels, final_preds)
-        base.update(l2)
+        binary_m = compute_binary_alarm_metrics(final_labels, final_preds)
+        base.update(binary_m)
         base.update({
             "true_labels": final_labels,
             "pred_labels": final_preds,
-            "pred_probs": final_probs,
+            "pred_probs":  final_probs,
+            "true_binary": final_labels,
+            "pred_binary": final_preds,
         })
-        binary = evaluate_classification_binary(final_labels, final_preds)
-        base.update(binary)
 
     return base
 
@@ -519,7 +521,7 @@ _SAMPLES_CACHE: list | None = None
 
 def _get_test_samples_for_labels(test_participant: str, cfg) -> list:
     """
-    Returns the test samples for a given participant so we can extract GT 3-class labels.
+    Returns the test samples for a given participant so we can extract GT labels.
     Uses a module-level cache populated during main() to avoid reloading.
     """
     global _SAMPLES_CACHE

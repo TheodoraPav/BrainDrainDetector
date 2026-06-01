@@ -325,6 +325,100 @@ def _apply_mask(channel: np.ndarray, mask: np.ndarray) -> np.ndarray:
     return out
 
 
+def _build_participant_masks_from_segments(
+    segments: list[dict[str, object]],
+    participant_left: str,
+    participant_right: str,
+    num_samples: int,
+    sample_rate: int,
+    dilate_ms: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Builds L/R keep-masks from cached segments.csv rows."""
+    mask_left = np.zeros(num_samples, dtype=bool)
+    mask_right = np.zeros(num_samples, dtype=bool)
+
+    for row in segments:
+        participant = row["assigned_participant"]
+        start = int(max(0.0, float(row["start_sec"])) * sample_rate)
+        end = int(min(num_samples, float(row["end_sec"])) * sample_rate)
+        if end <= start:
+            continue
+        if participant == participant_left:
+            mask_left[start:end] = True
+        elif participant == participant_right:
+            mask_right[start:end] = True
+
+    if dilate_ms > 0:
+        pad = max(1, int(sample_rate * dilate_ms / 1000.0))
+        structure = np.ones(pad, dtype=bool)
+        mask_left = binary_dilation(mask_left, structure=structure)
+        mask_right = binary_dilation(mask_right, structure=structure)
+
+    return mask_left, mask_right
+
+
+def load_cached_segments(segments_csv: Path) -> list[dict[str, object]]:
+    """Loads diarization intervals previously written by step 02."""
+    import csv
+
+    with segments_csv.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        rows: list[dict[str, object]] = []
+        for row in reader:
+            rows.append({
+                "source_file": row.get("source_file", ""),
+                "diarized_speaker": row["diarized_speaker"],
+                "assigned_participant": row["assigned_participant"],
+                "start_sec": float(row["start_sec"]),
+                "end_sec": float(row["end_sec"]),
+                "duration_sec": float(row["duration_sec"]),
+            })
+        return rows
+
+
+def separate_stereo_from_cached_segments(
+    left: np.ndarray,
+    right: np.ndarray,
+    sample_rate: int,
+    segments: list[dict[str, object]],
+    participant_left: str,
+    participant_right: str,
+    dilate_ms: float = 80.0,
+    min_gap_sec: float = 3.0,
+) -> DiarizationResult:
+    """
+    Rebuilds separated mono tracks from cached segments.csv (skips pyannote).
+
+    Applies the same gap-fill and overlap resolution as live diarization.
+    """
+    mask_left, mask_right = _build_participant_masks_from_segments(
+        segments,
+        participant_left,
+        participant_right,
+        len(left),
+        sample_rate,
+        dilate_ms,
+    )
+    mask_left = _fill_short_gaps(mask_left, sample_rate, min_gap_sec)
+    mask_right = _fill_short_gaps(mask_right, sample_rate, min_gap_sec)
+    mask_left, mask_right = _resolve_mask_overlaps(mask_left, mask_right, left, right)
+
+    speaker_to_participant = {
+        row["diarized_speaker"]: row["assigned_participant"]
+        for row in segments
+    }
+
+    return DiarizationResult(
+        left_track=_apply_mask(left, mask_left),
+        right_track=_apply_mask(right, mask_right),
+        speaker_to_participant=speaker_to_participant,
+        participant_left=participant_left,
+        participant_right=participant_right,
+        sample_rate=sample_rate,
+        segments=segments,
+    )
+
+
 def separate_stereo_speakers(
     left: np.ndarray,
     right: np.ndarray,

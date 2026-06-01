@@ -2,16 +2,15 @@
 Step 1 — Build labels from self-annotation CSVs.
 
 Reads every P{N}.self.csv from emotion_annotations/self_annotations/
-and applies the 3-class labeling logic defined in PROJECT_KNOWLEDGE.md.
+and applies the operational labeling rules (3-class internally, stored as binary).
 
 Outputs:
   data_processed/labels.csv
     columns: participant, seconds, label
-    label: 0=Optimal, 1=Overloaded, 2=GreyZone
+    label: 0=Safe, 1=Alarm
 
   data_processed/annotations.csv
     columns: participant, seconds, arousal, valence, label
-    Contains the raw annotation values alongside the derived label.
     Required by step 04 when task.store_raw_av_in_tensors is enabled.
 
 Usage:
@@ -25,16 +24,17 @@ from omegaconf import OmegaConf
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent))
-from utils.labels import classify_window
+from utils.labels import classify_window, merge_to_binary
 from utils.pipeline_log import format_count_summary, log_participant_counts, log_stats, stage_ok, stage_start
 
 
 def process_one_participant(csv_path: Path, participant_id: str, cfg) -> pd.DataFrame:
     """Loads one self-annotation CSV and returns a labeled DataFrame."""
     df = pd.read_csv(csv_path)
-    df["label"]       = df.apply(lambda row: classify_window(row, cfg.labels), axis=1)
-    df["participant"] = participant_id
-    return df[["participant", "seconds", "arousal", "valence", "label"]]
+    df["label_3class"] = df.apply(lambda row: classify_window(row, cfg.labels), axis=1)
+    df["label"]        = df["label_3class"].apply(merge_to_binary)
+    df["participant"]  = participant_id
+    return df[["participant", "seconds", "arousal", "valence", "label", "label_3class"]]
 
 
 def main(cfg):
@@ -63,25 +63,35 @@ def main(cfg):
 
     full_df = pd.concat(all_labels, ignore_index=True)
 
-    counts = full_df["label"].value_counts().sort_index()
-    print("\nLabel distribution:")
+    counts_3class = full_df["label_3class"].value_counts().sort_index()
+    print("\nInternal 3-class breakdown (before binary merge):")
     label_names = {0: "Optimal", 1: "Overloaded", 2: "Grey Zone"}
-    for label, count in counts.items():
+    for label, count in counts_3class.items():
         print(f"  Class {label} ({label_names[label]}): {count} windows ({count / len(full_df):.1%})")
+
+    binary_counts = full_df["label"].value_counts().sort_index()
+    print("\nBinary label distribution (Safe / Alarm):")
+    binary_names = {0: "Safe", 1: "Alarm"}
+    for label, count in binary_counts.items():
+        print(f"  {binary_names[label]} ({label}): {count} windows ({count / len(full_df):.1%})")
 
     labels_path = output_dir / "labels.csv"
     full_df[["participant", "seconds", "label"]].to_csv(labels_path, index=False)
 
     annotations_path = output_dir / "annotations.csv"
-    full_df[["participant", "seconds", "arousal", "valence", "label"]].to_csv(annotations_path, index=False)
+    full_df[["participant", "seconds", "arousal", "valence", "label"]].to_csv(
+        annotations_path, index=False,
+    )
 
     log_stats("01", {
         "participants": len(per_participant_counts),
         "total_windows": len(full_df),
         "windows_per_participant": format_count_summary(per_participant_counts.values()),
-        "class_0_optimal":   int(counts.get(0, 0)),
-        "class_1_overloaded": int(counts.get(1, 0)),
-        "class_2_grey":      int(counts.get(2, 0)),
+        "internal_class_0_optimal":   int(counts_3class.get(0, 0)),
+        "internal_class_1_overloaded": int(counts_3class.get(1, 0)),
+        "internal_class_2_grey":      int(counts_3class.get(2, 0)),
+        "binary_safe":  int(binary_counts.get(0, 0)),
+        "binary_alarm": int(binary_counts.get(1, 0)),
         "output_labels":     str(labels_path),
         "output_annotations": str(annotations_path),
     })
