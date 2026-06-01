@@ -389,6 +389,8 @@ def train_one_fold(
     final_metrics = compute_metrics(final_labels, final_preds)
 
     final_metrics["participant"] = test_participant
+    final_metrics["true_labels"] = final_labels
+    final_metrics["pred_labels"] = final_preds
 
 
 
@@ -449,6 +451,8 @@ def _evaluate_fold_checkpoint(
     _, labels, preds = run_one_epoch(model, test_loader, criterion, None, device, is_training=False)
     metrics = compute_metrics(labels, preds)
     metrics["participant"] = test_participant
+    metrics["true_labels"] = labels
+    metrics["pred_labels"] = preds
     return metrics
 
 
@@ -540,11 +544,19 @@ def main(cfg):
     results_path = Path(cfg.paths.data_processed) / "loso_results.pt"
     if results_path.is_file():
         data = torch.load(results_path, weights_only=False)
-        print(f"LOSO results already exist: {results_path}")
-        for key, value in data["summary"].items():
-            print(f"  {key}: {value}")
-        stage_ok("05", f"skipped — results already at {results_path}")
-        return
+        fold_metrics_existing = data.get("fold_metrics", [])
+        has_preds = bool(
+            fold_metrics_existing
+            and "true_labels" in fold_metrics_existing[0]
+            and "pred_labels" in fold_metrics_existing[0]
+        )
+        if has_preds:
+            print(f"LOSO results already exist: {results_path}")
+            for key, value in data["summary"].items():
+                print(f"  {key}: {value}")
+            stage_ok("05", f"skipped — results already at {results_path}")
+            return
+        print(f"LOSO results at {results_path} lack pred labels — re-running recovery for plots.")
 
     shared_audio_encoder = None
     if cfg.model.get("audio_encoder", "wav2vec2") == "wav2vec2":

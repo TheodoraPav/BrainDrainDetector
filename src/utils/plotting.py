@@ -89,6 +89,47 @@ def plot_f1_comparison(
     return str(save_path)
 
 
+def plot_loso_summary_bars(
+    summary: Dict[str, float],
+    figures_dir: str,
+    filename: str = "loso_metrics_summary.png",
+) -> str:
+    """Bar chart of LOSO mean metrics from loso_results.pt summary (no raw preds needed)."""
+    series = [
+        ("macro_f1_mean", "macro_f1_std", "Macro F1"),
+        ("recall_class0_mean", "recall_class0_std", "Recall Optimal"),
+        ("recall_class1_mean", "recall_class1_std", "Recall Overloaded"),
+        ("recall_class2_mean", "recall_class2_std", "Recall Grey Zone"),
+    ]
+    labels, means, stds = [], [], []
+    for mean_key, std_key, label in series:
+        if mean_key not in summary:
+            continue
+        val = summary[mean_key]
+        if isinstance(val, float) and np.isnan(val):
+            continue
+        labels.append(label)
+        means.append(float(val))
+        stds.append(float(summary.get(std_key, 0.0)))
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    x = np.arange(len(labels))
+    ax.bar(x, means, yerr=stds, capsize=4, color=["#4C72B0", "#55A868", "#DD8452", "#C44E52"][: len(labels)])
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=15, ha="right")
+    ax.set_ylim(0, 1.0)
+    ax.set_ylabel("Score (LOSO mean ± std)")
+    ax.set_title("Baseline LOSO metrics")
+    for i, m in enumerate(means):
+        ax.text(i, m + 0.02, f"{m:.3f}", ha="center", fontsize=9)
+    plt.tight_layout()
+
+    save_path = _ensure_figures_dir(figures_dir) / filename
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
+    return str(save_path)
+
+
 def plot_roc_curves(
     true_labels: List[int],
     predicted_probs: np.ndarray,

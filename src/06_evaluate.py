@@ -24,7 +24,12 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from utils.metrics import compute_metrics, print_classification_report, average_metrics_across_folds
 from utils.pipeline_log import log_stats, stage_ok, stage_start
-from utils.plotting import plot_confusion_matrix, plot_f1_comparison, plot_roc_curves
+from utils.plotting import (
+    plot_confusion_matrix,
+    plot_f1_comparison,
+    plot_loso_summary_bars,
+    plot_roc_curves,
+)
 
 
 def collect_all_predictions(fold_metrics: list) -> tuple:
@@ -70,15 +75,24 @@ def main(cfg, compare_all: bool = False):
     for key, value in summary.items():
         print(f"  {key}: {value}")
 
+    figures_dir_path = Path(figures_dir)
+    figures_dir_path.mkdir(parents=True, exist_ok=True)
+
+    summary_path = plot_loso_summary_bars(summary, figures_dir)
+    print(f"\nLOSO summary chart saved: {summary_path}")
+
     # ── Confusion matrix and ROC (if raw predictions are available) ──────────
     all_true, all_preds = collect_all_predictions(fold_metrics)
 
     if all_true:
         print_classification_report(all_true, all_preds)
-        cm_path  = plot_confusion_matrix(all_true, all_preds, figures_dir)
-        print(f"\nConfusion matrix saved: {cm_path}")
+        cm_path = plot_confusion_matrix(all_true, all_preds, figures_dir)
+        print(f"Confusion matrix saved: {cm_path}")
     else:
-        print("\nNote: Raw per-fold predictions not found. Rerun 05_train.py to save them.")
+        print(
+            "\nNote: No per-fold true_labels/pred_labels in loso_results.pt — "
+            "confusion matrix skipped. Summary chart was still saved."
+        )
 
     # ── F1 comparison across experiments ────────────────────────────────────
     if compare_all:
