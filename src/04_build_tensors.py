@@ -7,13 +7,20 @@ Saves one complete .pt file per window to data_processed/windows/.
 Each saved dict contains:
   - waveform:    (audio_samples,) float32
   - biosignals:  (time_steps, 6)  float32
-  - label:       int
+  - label:       int               3-class operational label
   - participant: str
+  - arousal:     int               raw self-report arousal (1-5)
+  - valence:     int               raw self-report valence (1-5)
+
+arousal and valence are always stored when annotations.csv exists
+(written by step 01). They are required for regression_va training but
+are harmlessly ignored in classification mode.
 
 For offline augmentation experiments: applies augmentation here and saves
 a second augmented copy of each window to data_processed/windows_aug/.
 
 Usage:
+    python src/04_build_tensors.py --config configs/exp_baseline.yaml
     python src/04_build_tensors.py --config configs/exp_offline_aug.yaml
 """
 
@@ -60,7 +67,7 @@ def build_offline_augmentation(cfg, quality_map: dict, participant_idx: int):
 
     if quality_is_perfect:
         transforms.append(lambda w, b: sensor_noise(w, b, quality_is_perfect=True))
-    
+
     transforms.append(AudioGaussianNoise(std=cfg.augmentation.audio_gaussian_std))
     return ComposeAugmentations(transforms)
 
@@ -68,14 +75,27 @@ def build_offline_augmentation(cfg, quality_map: dict, participant_idx: int):
 def main(cfg):
     stage_start("04", "join audio + physio + labels into final window tensors")
 
-    audio_dir  = Path(cfg.paths.data_processed) / "audio"
-    physio_dir = Path(cfg.paths.data_processed) / "physio"
-    labels_csv = Path(cfg.paths.data_processed) / "labels.csv"
-    output_dir = Path(cfg.paths.data_processed) / "windows"
+    audio_dir        = Path(cfg.paths.data_processed) / "audio"
+    physio_dir       = Path(cfg.paths.data_processed) / "physio"
+    labels_csv       = Path(cfg.paths.data_processed) / "labels.csv"
+    annotations_csv  = Path(cfg.paths.data_processed) / "annotations.csv"
+    output_dir       = Path(cfg.paths.data_processed) / "windows"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    labels_df   = pd.read_csv(labels_csv)
-    audio_index = load_audio_index(audio_dir)
+    use_annotations = annotations_csv.is_file()
+    if use_annotations:
+        source_df = pd.read_csv(annotations_csv)
+        print(f"Using annotations.csv (arousal + valence included).")
+    else:
+        source_df = pd.read_csv(labels_csv)
+        source_df["arousal"] = None
+        source_df["valence"] = None
+        print(
+            "annotations.csv not found — using labels.csv (arousal/valence will be absent). "
+            "Re-run step 01 to generate annotations.csv."
+        )
+
+    audio_index  = load_audio_index(audio_dir)
     physio_index = load_physio_index(physio_dir)
 
     offline_aug_enabled = cfg.augmentation.enabled
@@ -93,7 +113,7 @@ def main(cfg):
     counts_by_participant: dict[str, int] = defaultdict(int)
     label_counts: dict[int, int] = defaultdict(int)
 
-    for _, row in labels_df.iterrows():
+    for _, row in source_df.iterrows():
         participant = row["participant"]
         seconds     = int(row["seconds"])
         label       = int(row["label"])
@@ -109,6 +129,10 @@ def main(cfg):
             "label":       label,
             "participant": participant,
         }
+
+        if use_annotations and row["arousal"] is not None and row["valence"] is not None:
+            sample["arousal"] = int(row["arousal"])
+            sample["valence"] = int(row["valence"])
 
         filename = f"{participant}_sec{seconds:04d}.pt"
         torch.save(sample, output_dir / filename)
@@ -126,17 +150,18 @@ def main(cfg):
             torch.save(aug_sample, aug_output_dir / filename)
 
     log_stats("04", {
-        "saved_windows": saved_count,
-        "skipped_missing_modality": skipped_count,
-        "audio_files_indexed": len(audio_index),
-        "physio_files_indexed": len(physio_index),
-        "label_rows_total": len(labels_df),
-        "windows_per_participant": format_count_summary(counts_by_participant.values()),
-        "class_0_optimal": label_counts.get(0, 0),
-        "class_1_overloaded": label_counts.get(1, 0),
-        "class_2_grey": label_counts.get(2, 0),
-        "offline_augmentation": offline_aug_enabled,
-        "output_dir": str(output_dir),
+        "saved_windows":               saved_count,
+        "skipped_missing_modality":    skipped_count,
+        "audio_files_indexed":         len(audio_index),
+        "physio_files_indexed":        len(physio_index),
+        "label_rows_total":            len(source_df),
+        "windows_per_participant":     format_count_summary(counts_by_participant.values()),
+        "class_0_optimal":             label_counts.get(0, 0),
+        "class_1_overloaded":          label_counts.get(1, 0),
+        "class_2_grey":                label_counts.get(2, 0),
+        "offline_augmentation":        offline_aug_enabled,
+        "arousal_valence_stored":      use_annotations,
+        "output_dir":                  str(output_dir),
     })
     if offline_aug_enabled:
         log_stats("04", {"output_aug_dir": str(aug_output_dir)})
@@ -145,7 +170,7 @@ def main(cfg):
     if saved_count == 0:
         raise RuntimeError(
             f"Step 04 saved 0 windows. "
-            f"audio={len(audio_index)} physio={len(physio_index)} labels={len(labels_df)} "
+            f"audio={len(audio_index)} physio={len(physio_index)} labels={len(source_df)} "
             f"skipped={skipped_count}. "
             "Re-run step 03 (physio) — physio_files_indexed=0 means no physio tensors were built."
         )

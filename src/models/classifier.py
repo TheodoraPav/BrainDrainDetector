@@ -1,23 +1,30 @@
 """
 Full BrainDrainDetector model.
 
-Wires AudioEncoder + BiosignalEncoder + fusion layer + classification head
+Wires AudioEncoder + BiosignalEncoder + fusion layer + task head(s)
 into a single nn.Module.
 
-The fusion layer is selected by `cfg["fusion_mode"]`:
-  - "cross_attn_pooled"   : audio (1 token) attends over pooled biosignal token  (default)
-  - "sequence_cross_attn" : audio (1 token) attends over biosignal BiGRU sequence
-                            (extra option, more "attention like")
+Task modes (set via cfg["task_mode"]):
+  "classification"  — single nn.Linear(project_dim, num_classes) head.
+                      forward() returns logits of shape (batch, num_classes).
+                      Use nn.CrossEntropyLoss() on the output.
 
-The BiosignalEncoder automatically switches its return shape to match the
-fusion layer (pooled vector vs full sequence).
+  "regression_va"   — two independent heads:
+                        head_arousal: nn.Linear(project_dim, 1)
+                        head_valence: nn.Linear(project_dim, 1)
+                      forward() returns (batch, 2) FloatTensor [arousal, valence].
+                      Each head maps the shared fused representation to one
+                      continuous output in the native annotation scale (1-5).
 
-When `freeze_audio_backbone` is true (default), the pretrained Wav2Vec2
-backbone stays fixed. Training updates only the biosignal encoder, fusion
-layer, and classification head.
+Fusion mode (set via cfg["fusion_mode"]):
+  "cross_attn_pooled"   — audio (1 token) attends over pooled biosignal token.
+  "sequence_cross_attn" — audio (1 token) attends over BiGRU output sequence.
 
-Output: raw logits of shape (batch, 3) — one logit per class.
-Use nn.CrossEntropyLoss() which expects raw logits (no softmax here).
+Both fusion modes produce fused of shape (batch, project_dim) and are fully
+compatible with both task modes.
+
+When freeze_audio_backbone is true (default), the pretrained Wav2Vec2 weights
+stay fixed. Only the biosignal encoder, fusion layer, and head(s) train.
 """
 
 import torch
@@ -29,6 +36,7 @@ from .fusion import build_fusion_layer
 
 
 DEFAULT_FUSION_MODE = "cross_attn_pooled"
+DEFAULT_TASK_MODE   = "classification"
 
 
 class BrainDrainDetector(nn.Module):
@@ -36,12 +44,14 @@ class BrainDrainDetector(nn.Module):
     def __init__(self, cfg: dict, shared_audio_encoder: AudioEncoder | None = None):
         """
         Args:
-            cfg: the 'model' section of the YAML config as a plain dict.
+            cfg:                  the 'model' section of the YAML config as a plain dict,
+                                  optionally with "task_mode" injected by the training script.
             shared_audio_encoder: optional pre-loaded AudioEncoder (reused across LOSO folds).
         """
         super().__init__()
 
         self.fusion_mode = cfg.get("fusion_mode", DEFAULT_FUSION_MODE)
+        self.task_mode   = cfg.get("task_mode",   DEFAULT_TASK_MODE)
 
         if shared_audio_encoder is not None:
             self.audio_encoder = shared_audio_encoder
@@ -54,8 +64,6 @@ class BrainDrainDetector(nn.Module):
         num_signals = len(cfg.get("e4_signals",  ["EDA", "HR", "IBI"])) + \
                       len(cfg.get("eeg_signals", ["theta", "alpha", "beta"]))
 
-        # The biosignal encoder must return the full BiGRU output sequence
-        # when the sequence-aware fusion is selected.
         biosignal_returns_sequence = self.fusion_mode == "sequence_cross_attn"
 
         self.biosignal_encoder = BiosignalEncoder(
@@ -76,7 +84,11 @@ class BrainDrainDetector(nn.Module):
             dropout=cfg["fusion_dropout"],
         )
 
-        self.head = nn.Linear(project_dim, cfg["num_classes"])
+        if self.task_mode == "regression_va":
+            self.head_arousal = nn.Linear(project_dim, 1)
+            self.head_valence = nn.Linear(project_dim, 1)
+        else:
+            self.head = nn.Linear(project_dim, cfg["num_classes"])
 
     def forward(
         self,
@@ -85,16 +97,28 @@ class BrainDrainDetector(nn.Module):
     ) -> torch.Tensor:
         """
         Args:
-            waveform:   (batch, audio_samples)
+            waveform:   (batch, audio_samples) or (batch, 768) if embedding cached
             biosignals: (batch, time_steps, num_signals)
+
         Returns:
-            logits: (batch, 3)
+            classification:  logits  (batch, num_classes)
+            regression_va:   va_pred (batch, 2)  [arousal, valence]
         """
-        audio_emb         = self.audio_encoder(waveform)
-        biosignal_output  = self.biosignal_encoder(biosignals)
-        # biosignal_output is either:
-        #   (batch, embedding_dim)              if fusion_mode == "cross_attn_pooled"
-        #   (batch, time_steps, embedding_dim)  if fusion_mode == "sequence_cross_attn"
-        fused  = self.fusion(audio_emb, biosignal_output)
-        logits = self.head(fused)
-        return logits
+        if (
+            waveform.dim() == 2
+            and waveform.size(-1) == self.audio_encoder.embedding_dim
+            and waveform.size(-1) < 1024
+        ):
+            audio_emb = waveform
+        else:
+            audio_emb = self.audio_encoder(waveform)
+
+        biosignal_output = self.biosignal_encoder(biosignals)
+        fused = self.fusion(audio_emb, biosignal_output)
+
+        if self.task_mode == "regression_va":
+            arousal = self.head_arousal(fused).squeeze(-1)        # (batch,)
+            valence = self.head_valence(fused).squeeze(-1)        # (batch,)
+            return torch.stack([arousal, valence], dim=1)         # (batch, 2)
+        else:
+            return self.head(fused)                               # (batch, num_classes)

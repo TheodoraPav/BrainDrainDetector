@@ -2,9 +2,11 @@
 PyTorch Dataset for BrainDrainDetector.
 
 Each sample is one 5-second window from one participant and contains:
-  - waveform   : (audio_samples,)       float32 tensor
+  - waveform   : (audio_samples,)       float32 tensor  (or cached embedding)
   - biosignals : (time_steps, 6)        float32 tensor  [EDA, HR, IBI, theta, alpha, beta]
-  - label      : int                    0=Optimal, 1=Overloaded, 2=GreyZone
+  - target     : depends on task_mode —
+      classification:  int               0=Optimal, 1=Overloaded, 2=GreyZone
+      regression_va:   FloatTensor (2,)  [arousal, valence] in [1, 5]
   - participant: str                    participant ID (used for LOSO splits)
 
 The dataset reads pre-built .pt tensors from data_processed/ (created by 04_build_tensors.py).
@@ -15,30 +17,63 @@ import torch
 from collections import defaultdict
 from torch.utils.data import Dataset
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Union
+
+from .splits import (
+    build_loso_splits,
+    build_train_val_splits,
+    build_train_val_window_split,
+    pick_validation_participant,
+)
 
 
 class BrainDrainDataset(Dataset):
 
-    def __init__(self, samples: List[dict]):
+    def __init__(self, samples: List[dict], task_mode: str = "classification"):
         """
         Args:
-            samples: list of dicts, each with keys:
-                       "waveform", "biosignals", "label", "participant"
+            samples:   list of dicts, each with keys waveform/audio_embedding,
+                       biosignals, label, participant (and optionally arousal, valence)
+            task_mode: "classification" — returns integer label as target
+                       "regression_va" — returns FloatTensor([arousal, valence]) as target
         """
-        self.samples = samples
+        self.samples   = samples
+        self.task_mode = task_mode
 
     def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, int]:
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, Union[int, torch.Tensor]]:
         sample = self.samples[idx]
 
-        waveform   = sample["waveform"]
-        biosignals = sample["biosignals"]
-        label      = sample["label"]
+        if "audio_embedding" in sample:
+            audio_input = sample["audio_embedding"]
+        elif "waveform" in sample:
+            audio_input = sample["waveform"]
+        else:
+            raise KeyError(
+                f"Sample {sample.get('participant', '?')} sec={sample.get('seconds', '?')} "
+                "has neither audio_embedding nor waveform."
+            )
 
-        return waveform, biosignals, label
+        biosignals = sample["biosignals"]
+
+        if self.task_mode == "regression_va":
+            if "arousal" not in sample or "valence" not in sample:
+                raise KeyError(
+                    f"Sample {sample.get('participant', '?')} sec={sample.get('seconds', '?')} "
+                    "is missing arousal/valence fields. "
+                    "Re-run step 01 (to generate annotations.csv) then step 04 "
+                    "to rebuild window tensors with arousal/valence stored."
+                )
+            target = torch.tensor(
+                [float(sample["arousal"]), float(sample["valence"])],
+                dtype=torch.float32,
+            )
+        else:
+            target = sample["label"]
+
+        return audio_input, biosignals, target
 
 
 def load_all_samples(data_processed_dir: str) -> List[dict]:
@@ -57,26 +92,9 @@ def load_all_samples(data_processed_dir: str) -> List[dict]:
     return samples
 
 
-def build_loso_splits(samples: List[dict], test_participant: str) -> Tuple[List[dict], List[dict]]:
-    """
-    Leave One Subject Out split.
-
-    Args:
-        samples:          full list of samples
-        test_participant: participant ID to hold out as test set
-
-    Returns:
-        train_samples, test_samples
-    """
-    train_samples = [s for s in samples if s["participant"] != test_participant]
-    test_samples  = [s for s in samples if s["participant"] == test_participant]
-    return train_samples, test_samples
-
-
 def get_all_participant_ids(samples: List[dict]) -> List[str]:
     """Returns a sorted list of unique participant IDs."""
-    ids = sorted(set(s["participant"] for s in samples))
-    return ids
+    return sorted(set(s["participant"] for s in samples))
 
 
 def count_samples_per_participant(samples: List[dict]) -> Dict[str, int]:
@@ -108,9 +126,7 @@ def compute_participant_sample_cap(train_samples: List[dict]) -> int:
     counts = list(count_samples_per_participant(train_samples).values())
     if not counts:
         return 0
-
-    k_cap = int(np.median(counts))
-    return max(1, k_cap)
+    return max(1, int(np.median(counts)))
 
 
 def build_balanced_epoch_indices(
@@ -166,23 +182,17 @@ def summarize_balanced_epoch(
     for idx in epoch_indices:
         label_counts[train_samples[idx]["label"]] += 1
 
-    draw_summary = {
-        "min": min(draw_values) if draw_values else 0,
-        "median": int(np.median(draw_values)) if draw_values else 0,
-        "max": max(draw_values) if draw_values else 0,
-    }
-
     return {
         "k_cap": k_cap,
         "participants_in_epoch": len(draws),
         "epoch_samples": total_samples,
         "epoch_batches": num_batches,
         "batch_size": batch_size,
-        "draws_per_participant_min": draw_summary["min"],
-        "draws_per_participant_median": draw_summary["median"],
-        "draws_per_participant_max": draw_summary["max"],
-        "label_0_optimal": label_counts.get(0, 0),
+        "draws_per_participant_min":    min(draw_values) if draw_values else 0,
+        "draws_per_participant_median": int(np.median(draw_values)) if draw_values else 0,
+        "draws_per_participant_max":    max(draw_values) if draw_values else 0,
+        "label_0_optimal":    label_counts.get(0, 0),
         "label_1_overloaded": label_counts.get(1, 0),
-        "label_2_grey": label_counts.get(2, 0),
+        "label_2_grey":       label_counts.get(2, 0),
         "draws_by_participant": draws,
     }

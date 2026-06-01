@@ -9,6 +9,23 @@ paths:
   checkpoints: "checkpoints"
 
 # ============================================================
+# Task mode
+# ============================================================
+task:
+  # "classification"  — 3-class CE (Optimal / Overloaded / Grey Zone)
+  # "regression_va"   — predict Arousal + Valence directly (2 heads)
+  mode: "classification"
+
+  # Store raw arousal + valence in each window tensor during step 04.
+  # Required for regression_va. Safe to enable for classification too
+  # (fields are ignored by the classification data loader).
+  store_raw_av_in_tensors: true
+
+  # After each regression_va fold: derive predicted 3-class and binary
+  # alarm metrics using va_only rules and report all three evaluation layers.
+  derived_3class_eval: true
+
+# ============================================================
 # Data
 # ============================================================
 data:
@@ -29,6 +46,7 @@ data:
 # Labels
 # ============================================================
 labels:
+  # ── Full rules (used in step 01, classification training) ──────────────────
   # Class 1: Overloaded
   overloaded_max_valence: 3
   overloaded_min_arousal: 4
@@ -38,23 +56,38 @@ labels:
   optimal_required_emotion: "concentration"
   optimal_forbidden_emotions: ["frustration", "confusion", "nervous", "angry", "sad", "boredom"]
 
+  # ── VA-only rules (used post-training for derived 3-class from â, v̂) ───────
+  # Applied when emotion flags are unavailable (regression_va output).
+  # Class 1: low valence AND high arousal
+  va_only_overloaded_max_valence: 3
+  va_only_overloaded_min_arousal: 4
+  # Class 0: high valence AND low arousal (relaxed — no concentration flag)
+  va_only_optimal_min_valence: 4
+  va_only_optimal_max_arousal: 2
+
 # ============================================================
 # Model
 # ============================================================
 model:
   audio_encoder: "wav2vec2"   # options: "wav2vec2", "resnet18"
-  # Keep the pretrained Wav2Vec2 weights fixed. Only BiGRU, fusion, and head train.
+  # Keep the pretrained Wav2Vec2 weights fixed. Only BiGRU, fusion, and head(s) train.
   # Applies only when audio_encoder is "wav2vec2".
   freeze_audio_backbone: true
   biosignal_hidden_size: 128
   biosignal_num_layers: 2
   fusion_num_heads: 4
   fusion_dropout: 0.1
+  # Used by classification task only.
   num_classes: 3
   # Fusion layer selection.
   #   cross_attn_pooled   -> baseline cross-attention with a pooled biosignal token (default)
   #   sequence_cross_attn -> audio query attends over the BiGRU output sequence (extra option)
   fusion_mode: "cross_attn_pooled"
+
+  # ── regression_va settings ─────────────────────────────────────────────────
+  # Loss applied independently per head; combined as w_a * L_a + w_v * L_v.
+  va_loss: "smooth_l1"          # "smooth_l1" | "mse"
+  va_loss_weights: [1.0, 1.0]   # [w_arousal, w_valence]
 
 # ============================================================
 # Training
@@ -67,6 +100,19 @@ training:
   seed: 42
   # Balanced sampling: K = median(n_i) per participant per epoch (see dataset.py)
   balanced_sampling: true
+  # Stop a fold when validation metric does not improve (0 = train all epochs).
+  early_stopping_patience: 8
+  early_stopping_min_epochs: 5
+  # Metric used for checkpoint selection and early stopping.
+  #   classification:  "macro_f1"
+  #   regression_va:   "ccc_mean"
+  selection_metric: "macro_f1"
+  # One-time Wav2Vec2 forward pass per window, then train on 768-d vectors only.
+  cache_audio_embeddings: true
+  # Free RAM after cache (safe with frozen wav2vec2 only).
+  drop_waveform_after_embedding_cache: true
+  # Mixed precision on CUDA (faster; no effect on CPU).
+  use_amp: true
 
 # ============================================================
 # Augmentation — overridden per experiment

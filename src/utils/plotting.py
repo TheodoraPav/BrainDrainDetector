@@ -3,13 +3,21 @@ Plotting utilities for BrainDrainDetector.
 
 All functions save figures to the figures/ directory and return the file path.
 
-Functions:
-  plot_confusion_matrix   : heatmap of predicted vs true labels
-  plot_f1_comparison      : grouped bar chart comparing F1 across experiments
-  plot_roc_curves         : one-vs-rest ROC curves for each class
-  plot_attention_map         : heatmap of Cross-Attention weights (pooled fusion: 1x1 per head)
-  plot_attention_over_time   : heatmap and line plot of attention weights over biosignal time steps
-                               (used by the sequence_cross_attn fusion)
+Classification:
+  plot_confusion_matrix      3x3 heatmap of predicted vs true 3-class labels
+  plot_f1_comparison         grouped bar chart comparing F1 across experiments
+  plot_roc_curves            one-vs-rest ROC curves for each class
+  plot_loso_summary_bars     bar chart of mean LOSO metrics from a summary dict
+
+Regression VA (new):
+  plot_va_scatter            scatter true vs pred for arousal or valence
+  plot_va_metrics_bars       CCC and MAE bars for both dimensions
+  plot_binary_alarm_confusion 2x2 confusion matrix after Safe/Alarm merge
+
+Explainability:
+  plot_attention_map         heatmap of Cross-Attention weights (pooled fusion: 1x1 per head)
+  plot_attention_over_time   heatmap and line plot over biosignal time steps
+                             (used by the sequence_cross_attn fusion)
 """
 
 import numpy as np
@@ -156,6 +164,140 @@ def plot_roc_curves(
     ax.set_ylabel("True Positive Rate")
     ax.set_title("ROC Curves (One vs Rest)")
     ax.legend(loc="lower right")
+    plt.tight_layout()
+
+    save_path = _ensure_figures_dir(figures_dir) / filename
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
+    return str(save_path)
+
+
+def plot_va_scatter(
+    true_vals:  List[float],
+    pred_vals:  List[float],
+    dimension:  str,
+    figures_dir: str,
+    filename:   str | None = None,
+) -> str:
+    """
+    Scatter plot of true vs predicted values for one VA dimension.
+
+    Args:
+        true_vals:  ground-truth arousal or valence values
+        pred_vals:  model predictions
+        dimension:  "Arousal" or "Valence" (used in title / filename)
+        figures_dir: output directory
+        filename:   optional override; defaults to va_scatter_{dimension.lower()}.png
+    """
+    if filename is None:
+        filename = f"va_scatter_{dimension.lower()}.png"
+
+    true_arr = np.array(true_vals)
+    pred_arr = np.array(pred_vals)
+    lim = (0.5, 5.5)
+
+    fig, ax = plt.subplots(figsize=(5, 5))
+    ax.scatter(true_arr, pred_arr, alpha=0.35, s=18, color="#4C72B0")
+    ax.plot(lim, lim, "k--", linewidth=0.8, label="y = x")
+    ax.set_xlim(lim)
+    ax.set_ylim(lim)
+    ax.set_xlabel(f"True {dimension}")
+    ax.set_ylabel(f"Predicted {dimension}")
+    ax.set_title(f"{dimension} — True vs Predicted (LOSO pooled)")
+    ax.legend(loc="upper left", fontsize=8)
+    plt.tight_layout()
+
+    save_path = _ensure_figures_dir(figures_dir) / filename
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
+    return str(save_path)
+
+
+def plot_va_metrics_bars(
+    summary: Dict[str, float],
+    figures_dir: str,
+    filename: str = "va_metrics_bars.png",
+) -> str:
+    """
+    Bar chart comparing CCC and MAE for arousal vs valence (LOSO mean ± std).
+
+    Args:
+        summary: LOSO summary dict containing *_mean and *_std keys
+        figures_dir: output directory
+    """
+    metrics = [
+        ("ccc_arousal",  "CCC Arousal"),
+        ("ccc_valence",  "CCC Valence"),
+        ("mae_arousal",  "MAE Arousal"),
+        ("mae_valence",  "MAE Valence"),
+    ]
+
+    labels, means, stds = [], [], []
+    for key, label in metrics:
+        mean_key = f"{key}_mean"
+        std_key  = f"{key}_std"
+        if mean_key not in summary:
+            continue
+        val = summary[mean_key]
+        if isinstance(val, float) and np.isnan(val):
+            continue
+        labels.append(label)
+        means.append(float(val))
+        stds.append(float(summary.get(std_key, 0.0)))
+
+    if not labels:
+        return ""
+
+    colors = ["#4C72B0", "#4C72B0", "#DD8452", "#DD8452"]
+    fig, ax = plt.subplots(figsize=(8, 4))
+    x = np.arange(len(labels))
+    ax.bar(x, means, yerr=stds, capsize=4, color=colors[: len(labels)])
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=15, ha="right")
+    ax.set_ylim(0, max(means) * 1.3 if means else 1.0)
+    ax.set_ylabel("Score (LOSO mean ± std)")
+    ax.set_title("VA Regression metrics (LOSO)")
+    for i, m in enumerate(means):
+        ax.text(i, m + 0.01, f"{m:.3f}", ha="center", fontsize=9)
+    plt.tight_layout()
+
+    save_path = _ensure_figures_dir(figures_dir) / filename
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
+    return str(save_path)
+
+
+def plot_binary_alarm_confusion(
+    true_binary: List[int],
+    pred_binary: List[int],
+    figures_dir: str,
+    filename: str = "confusion_matrix_binary_alarm.png",
+) -> str:
+    """
+    2x2 normalized confusion matrix for the binary Safe / Alarm classification.
+
+    Args:
+        true_binary: ground-truth binary labels (0 = Safe, 1 = Alarm)
+        pred_binary: predicted binary labels
+        figures_dir: output directory
+    """
+    cm = confusion_matrix(true_binary, pred_binary, labels=[0, 1])
+    row_sums = cm.sum(axis=1, keepdims=True)
+    cm_norm  = cm.astype(float) / np.maximum(row_sums, 1)
+
+    fig, ax = plt.subplots(figsize=(4, 4))
+    sns.heatmap(
+        cm_norm,
+        annot=True,
+        fmt=".2f",
+        cmap="Blues",
+        xticklabels=["Safe", "Alarm"],
+        yticklabels=["Safe", "Alarm"],
+        ax=ax,
+    )
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("True")
+    ax.set_title("Alarm Confusion Matrix (normalized)")
     plt.tight_layout()
 
     save_path = _ensure_figures_dir(figures_dir) / filename
