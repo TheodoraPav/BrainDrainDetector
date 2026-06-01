@@ -43,6 +43,7 @@ from utils.plotting import (
     plot_f1_comparison,
     plot_loso_summary_bars,
     plot_roc_curves,
+    plot_binary_roc_curve,
     plot_va_scatter,
     plot_va_metrics_bars,
     plot_binary_alarm_confusion,
@@ -136,6 +137,17 @@ def _report_layer2_3class(summary: dict, fold_metrics: list, figures_dir: str, l
         cm_path = plot_confusion_matrix(all_true, all_pred, figures_dir, filename=cm_filename)
         print(f"Confusion matrix (3-class) saved: {cm_path}")
 
+    if not label_prefix:
+        pred_probs = _collect_flat(fold_metrics, "pred_probs")
+        if all_true and pred_probs:
+            try:
+                pred_probs_arr = np.array(pred_probs)
+                if len(pred_probs_arr.shape) == 2 and pred_probs_arr.shape[1] == 3:
+                    roc_path = plot_roc_curves(all_true, pred_probs_arr, figures_dir)
+                    print(f"3-class ROC curves (One-vs-Rest) saved: {roc_path}")
+            except Exception as e:
+                print(f"  Warning: could not plot 3-class ROC curves: {e}")
+
 
 def _report_layer3_binary(summary: dict, fold_metrics: list, figures_dir: str) -> None:
     """Prints and plots Layer 3 — Binary Alarm metrics."""
@@ -160,6 +172,105 @@ def _report_layer3_binary(summary: dict, fold_metrics: list, figures_dir: str) -
     if true_binary and pred_binary:
         cm_path = plot_binary_alarm_confusion(true_binary, pred_binary, figures_dir)
         print(f"Binary alarm confusion matrix saved: {cm_path}")
+
+    pred_probs = _collect_flat(fold_metrics, "pred_probs")
+    if true_binary and pred_probs:
+        try:
+            pred_probs_arr = np.array(pred_probs)
+            if len(pred_probs_arr.shape) == 2 and pred_probs_arr.shape[1] == 3:
+                alarm_probs = pred_probs_arr[:, 1].tolist()
+                roc_path = plot_binary_roc_curve(true_binary, alarm_probs, figures_dir)
+                print(f"Binary alarm ROC curve saved: {roc_path}")
+        except Exception as e:
+            print(f"  Warning: could not plot Binary Alarm ROC curve: {e}")
+
+
+def plot_sample_participant_timelines(fold_metrics: list, figures_dir: str) -> None:
+    """Generates timeline detection plots for 5 sample participants."""
+    import matplotlib.pyplot as plt
+
+    timeline_dir = Path(figures_dir) / "timelines"
+    timeline_dir.mkdir(parents=True, exist_ok=True)
+
+    sorted_folds = sorted(fold_metrics, key=lambda f: f.get("participant", ""))
+    sample_folds = sorted_folds[:5]
+    if not sample_folds:
+        return
+
+    print(f"\nGenerating timeline detection plots for {len(sample_folds)} participants...")
+    for fold in sample_folds:
+        participant = fold.get("participant", "Unknown")
+        true_binary = fold.get("true_binary", [])
+        pred_binary = fold.get("pred_binary", [])
+
+        if not true_binary or not pred_binary:
+            continue
+
+        time_steps = np.arange(1, len(true_binary) + 1) * 5
+
+        # Check if continuous regression lists exist
+        true_a = fold.get("true_arousal", [])
+        true_v = fold.get("true_valence", [])
+        pred_a = fold.get("pred_arousal", [])
+        pred_v = fold.get("pred_valence", [])
+        is_regression = len(true_a) > 0 and len(pred_a) > 0
+
+        if is_regression:
+            # 3-row subplot: Arousal, Valence, Binary Alarm
+            fig, axs = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
+
+            # Subplot 1: Arousal
+            axs[0].plot(time_steps, true_a, label="True Arousal (Self-Report)", color="#e63946", linewidth=2)
+            axs[0].plot(time_steps, pred_a, label="Predicted Arousal", color="#f1a7a9", linewidth=1.5, linestyle="--")
+            axs[0].set_title(f"Continuous Arousal Tracking", fontsize=11, fontweight="bold")
+            axs[0].set_ylabel("Arousal (1-5)", fontsize=10)
+            axs[0].grid(True, linestyle=":", alpha=0.6)
+            axs[0].legend(loc="upper right")
+            axs[0].set_ylim(0.8, 5.2)
+
+            # Subplot 2: Valence
+            axs[1].plot(time_steps, true_v, label="True Valence (Self-Report)", color="#1d3557", linewidth=2)
+            axs[1].plot(time_steps, pred_v, label="Predicted Valence", color="#a8dadc", linewidth=1.5, linestyle="--")
+            axs[1].set_title(f"Continuous Valence Tracking", fontsize=11, fontweight="bold")
+            axs[1].set_ylabel("Valence (1-5)", fontsize=10)
+            axs[1].grid(True, linestyle=":", alpha=0.6)
+            axs[1].legend(loc="upper right")
+            axs[1].set_ylim(0.8, 5.2)
+
+            # Subplot 3: Binary Alarm
+            axs[2].step(time_steps, true_binary, label="True Overload State", color="#e63946", linewidth=2, where="post")
+            axs[2].step(time_steps, pred_binary, label="Derived Model Alarm", color="#457b9d", linewidth=1.5, linestyle="--", where="post")
+            axs[2].set_title(f"Derived Real-Time Binary Alarm", fontsize=11, fontweight="bold")
+            axs[2].set_ylabel("State", fontsize=10)
+            axs[2].set_yticks([0, 1])
+            axs[2].set_yticklabels(["Safe", "Alarm"])
+            axs[2].grid(True, linestyle=":", alpha=0.6)
+            axs[2].legend(loc="upper right")
+            axs[2].set_ylim(-0.1, 1.1)
+
+            # Global settings
+            axs[2].set_xlabel("Debate Time (Seconds)", fontsize=12)
+            fig.suptitle(f"Real-Time Multimodal Cognitive Overload Detection — Participant {participant}", fontsize=14, fontweight="bold")
+            plt.tight_layout()
+        else:
+            # Simple 1-row binary timeline plot
+            plt.figure(figsize=(12, 5))
+            plt.step(time_steps, true_binary, label="True Overload (Self-Report)", color="#e63946", linewidth=2, where="post")
+            plt.step(time_steps, pred_binary, label="Model Alarm (Predictions)", color="#457b9d", linewidth=1.5, linestyle="--", where="post")
+
+            plt.title(f"Real-Time Cognitive Overload Detection — Participant {participant}", fontsize=14, fontweight="bold")
+            plt.xlabel("Debate Time (Seconds)", fontsize=12)
+            plt.ylabel("State", fontsize=12)
+            plt.yticks([0, 1], ["Safe (0)", "Overloaded (1)"], fontsize=11)
+            plt.grid(True, linestyle=":", alpha=0.6)
+            plt.legend(fontsize=11, loc="upper right")
+            plt.ylim(-0.1, 1.1)
+            plt.tight_layout()
+
+        out_path = timeline_dir / f"detection_timeline_{participant}.png"
+        plt.savefig(out_path, dpi=150)
+        plt.close()
+        print(f"  Timeline plot saved: {out_path}")
 
 
 def main(cfg, compare_all: bool = False):
@@ -192,6 +303,7 @@ def main(cfg, compare_all: bool = False):
         print(f"\nLOSO summary chart saved: {summary_path}")
 
     _report_layer3_binary(summary, fold_metrics, figures_dir)
+    plot_sample_participant_timelines(fold_metrics, figures_dir)
 
     # ── F1 comparison across experiments ─────────────────────────────────────
     if compare_all:

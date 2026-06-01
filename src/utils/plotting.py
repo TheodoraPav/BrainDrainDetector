@@ -398,3 +398,34 @@ def plot_attention_over_time(
     fig.savefig(save_path, dpi=150)
     plt.close(fig)
     return str(save_path)
+
+
+def plot_binary_roc_curve(
+    true_binary: List[int],
+    predicted_alarm_probs: List[float],
+    figures_dir: str,
+    filename: str = "roc_curve_binary_alarm.png",
+) -> str:
+    """
+    Plots a ROC curve for the binary Safe vs Alarm classification.
+    """
+    true_arr = np.array(true_binary)
+    pred_arr = np.array(predicted_alarm_probs)
+
+    fpr, tpr, _ = roc_curve(true_arr, pred_arr)
+    roc_auc = auc(fpr, tpr)
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ax.plot(fpr, tpr, color="#e63946", linewidth=2, label=f"Binary Alarm (AUC = {roc_auc:.4f})")
+    ax.plot([0, 1], [0, 1], "k--", linewidth=0.8)
+    ax.set_xlabel("False Positive Rate")
+    ax.set_ylabel("True Positive Rate")
+    ax.set_title("ROC Curve — Binary Alarm (Safe vs Alarm)")
+    ax.legend(loc="lower right")
+    ax.grid(True, linestyle=":", alpha=0.6)
+    plt.tight_layout()
+
+    save_path = _ensure_figures_dir(figures_dir) / filename
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
+    return str(save_path)

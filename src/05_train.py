@@ -180,6 +180,7 @@ def run_one_epoch(
         avg_loss:   float
         all_labels: list — integers (classification) or [a,v] pairs (regression_va)
         all_preds:  list — integers (classification) or [â,v̂] pairs (regression_va)
+        all_probs:  list — softmax probabilities for classification, or empty list for regression
     """
     if is_training:
         model.train()
@@ -189,6 +190,7 @@ def run_one_epoch(
     total_loss = 0.0
     all_preds  = []
     all_labels = []
+    all_probs  = []
 
     context    = torch.enable_grad() if is_training else torch.no_grad()
     amp_enabled = use_amp and device.type == "cuda"
@@ -223,12 +225,14 @@ def run_one_epoch(
                 all_preds.extend(output.detach().cpu().tolist())
                 all_labels.extend(targets.cpu().tolist())
             else:
+                probs = torch.softmax(output, dim=1)
+                all_probs.extend(probs.detach().cpu().tolist())
                 preds = output.argmax(dim=1)
                 all_preds.extend(preds.cpu().tolist())
                 all_labels.extend(targets.cpu().tolist())
 
     avg_loss = total_loss / max(len(loader), 1)
-    return avg_loss, all_labels, all_preds
+    return avg_loss, all_labels, all_preds, all_probs
 
 
 def _compute_epoch_score(all_labels, all_preds, task_mode: str, selection_metric: str) -> float:
@@ -406,11 +410,11 @@ def train_one_fold(
                 num_workers=0,
             )
 
-        train_loss, _, _ = run_one_epoch(
+        train_loss, _, _, _ = run_one_epoch(
             model, train_loader, criterion, optimizer, device,
             is_training=True, task_mode=task_mode, use_amp=use_amp, scaler=scaler,
         )
-        val_loss, val_labels, val_preds = run_one_epoch(
+        val_loss, val_labels, val_preds, _ = run_one_epoch(
             model, val_loader, criterion, optimizer, device,
             is_training=False, task_mode=task_mode, use_amp=use_amp,
         )
@@ -441,13 +445,13 @@ def train_one_fold(
             break
 
     model.load_state_dict(torch.load(best_ckpt_path, weights_only=True))
-    _, final_labels, final_preds = run_one_epoch(
+    _, final_labels, final_preds, final_probs = run_one_epoch(
         model, test_loader, criterion, None, device,
         is_training=False, task_mode=task_mode, use_amp=use_amp,
     )
 
     fold_metrics = _build_fold_metrics(
-        final_labels, final_preds, test_participant, task_mode, cfg,
+        final_labels, final_preds, final_probs, test_participant, task_mode, cfg,
     )
     fold_metrics["epochs_run"]  = epochs_run
     fold_metrics["best_val_metric"] = round(best_score, 4)
@@ -469,7 +473,7 @@ def train_one_fold(
     return fold_metrics
 
 
-def _build_fold_metrics(final_labels, final_preds, participant, task_mode, cfg) -> dict:
+def _build_fold_metrics(final_labels, final_preds, final_probs, participant, task_mode, cfg) -> dict:
     """Assembles the complete metrics dict for one fold, covering all evaluation layers."""
     base = {"participant": participant}
 
@@ -502,6 +506,7 @@ def _build_fold_metrics(final_labels, final_preds, participant, task_mode, cfg) 
         base.update({
             "true_labels": final_labels,
             "pred_labels": final_preds,
+            "pred_probs": final_probs,
         })
         binary = evaluate_classification_binary(final_labels, final_preds)
         base.update(binary)
@@ -567,11 +572,11 @@ def _evaluate_fold_checkpoint(
         shuffle=False,
         num_workers=0,
     )
-    _, final_labels, final_preds = run_one_epoch(
+    _, final_labels, final_preds, final_probs = run_one_epoch(
         model, test_loader, criterion, None, device,
         is_training=False, task_mode=task_mode,
     )
-    return _build_fold_metrics(final_labels, final_preds, test_participant, task_mode, cfg)
+    return _build_fold_metrics(final_labels, final_preds, final_probs, test_participant, task_mode, cfg)
 
 
 def recover_loso_from_checkpoints(
