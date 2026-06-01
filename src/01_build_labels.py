@@ -1,8 +1,8 @@
 """
 Step 1 — Build labels from self-annotation CSVs.
 
-Reads every P{N}.self.csv from emotion_annotations/self_annotations/
-and applies the operational labeling rules (3-class internally, stored as binary).
+Reads every P{N}.self.csv and builds binary labels from arousal + valence only
+(no emotion flags). Internal 3-class rule, then Safe/Alarm merge.
 
 Outputs:
   data_processed/labels.csv

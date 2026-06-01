@@ -44,24 +44,13 @@ data:
 # Labels
 # ============================================================
 labels:
-  # ── Full rules (used in step 01, classification training) ──────────────────
-  # Class 1: Overloaded
+  # Ground truth (step 01) and derived alarm (regression_va) — arousal + valence only.
+  # Overloaded (→ Alarm): low valence AND high arousal
   overloaded_max_valence: 3
   overloaded_min_arousal: 4
-  overloaded_negative_emotions: ["frustration", "confusion", "nervous"]
-  # Class 0: Optimal
-  optimal_min_valence: 3
-  optimal_required_emotion: "concentration"
-  optimal_forbidden_emotions: ["frustration", "confusion", "nervous", "angry", "sad", "boredom"]
-
-  # ── VA-only rules (used post-training to derive binary from â, v̂) ─────────
-  # Applied when emotion flags are unavailable (regression_va output).
-  # Class 1: low valence AND high arousal
-  va_only_overloaded_max_valence: 3
-  va_only_overloaded_min_arousal: 4
-  # Class 0: high valence AND low arousal (relaxed — no concentration flag)
-  va_only_optimal_min_valence: 4
-  va_only_optimal_max_arousal: 2
+  # Optimal (→ Safe via merge): high valence AND low arousal
+  optimal_min_valence: 4
+  optimal_max_arousal: 2
 
 # ============================================================
 # Model
