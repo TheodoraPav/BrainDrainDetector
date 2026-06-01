@@ -81,7 +81,7 @@ def _build_model_cfg(cfg) -> dict:
     return model_cfg
 
 
-def _build_criterion(cfg) -> nn.Module:
+def _build_criterion(cfg, weights: torch.Tensor | None = None) -> nn.Module:
     """Returns the appropriate loss function for the active task mode."""
     if _task_mode(cfg) == "regression_va":
         return _VALoss(
@@ -89,7 +89,7 @@ def _build_criterion(cfg) -> nn.Module:
             weight_arousal=cfg.model.va_loss_weights[0],
             weight_valence=cfg.model.va_loss_weights[1],
         )
-    return nn.CrossEntropyLoss()
+    return nn.CrossEntropyLoss(weight=weights)
 
 
 class _VALoss(nn.Module):
@@ -320,8 +320,31 @@ def train_one_fold(
         })
         log_participant_counts("05", participant_counts, limit=0)
 
+    class_weights = None
+    if task_mode == "classification" and cfg.training.get("weighted_loss", True):
+        # Calculate dynamic class weights based on fit_samples
+        class_counts = {0: 0, 1: 0, 2: 0}
+        for s in fit_samples:
+            lbl = s["label"]
+            class_counts[lbl] = class_counts.get(lbl, 0) + 1
+
+        total = len(fit_samples)
+        num_classes = 3
+        weights = []
+        print("  Dynamically calculated class weights (inverse frequency):")
+        for c in range(num_classes):
+            count = class_counts[c]
+            if count > 0:
+                w = total / (num_classes * count)
+            else:
+                w = 1.0
+            weights.append(w)
+            print(f"    Class {c}: count={count}, weight={w:.4f}")
+
+        class_weights = torch.tensor(weights, dtype=torch.float32).to(device)
+
     model     = BrainDrainDetector(_build_model_cfg(cfg), shared_audio_encoder=shared_audio_encoder).to(device)
-    criterion = _build_criterion(cfg)
+    criterion = _build_criterion(cfg, weights=class_weights)
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     total_params     = sum(p.numel() for p in model.parameters())

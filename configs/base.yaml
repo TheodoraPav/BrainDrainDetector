@@ -100,6 +100,8 @@ training:
   seed: 42
   # Balanced sampling: K = median(n_i) per participant per epoch (see dataset.py)
   balanced_sampling: true
+  # Weighted loss for classification class imbalance (inverse frequency)
+  weighted_loss: true
   # Stop a fold when validation metric does not improve (0 = train all epochs).
   early_stopping_patience: 8
   early_stopping_min_epochs: 5
