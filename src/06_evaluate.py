@@ -23,13 +23,20 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from utils.metrics import print_classification_report, average_metrics_across_folds
 from utils.pipeline_log import log_stats, stage_ok, stage_start
+from utils.va_report import build_va_evaluation_report, print_va_evaluation_report, save_va_evaluation_report
 from utils.plotting import (
     plot_confusion_matrix,
     plot_f1_comparison,
     plot_loso_summary_bars,
     plot_roc_curve,
-    plot_va_scatter,
+    plot_va_agreement_summary,
+    plot_va_bland_altman,
+    plot_va_combined_panel,
+    plot_va_error_histogram,
     plot_va_metrics_bars,
+    plot_va_per_participant_ccc,
+    plot_va_scatter,
+    plot_va_scatter_with_stats,
 )
 
 
@@ -58,9 +65,17 @@ def _collect_flat(fold_metrics: list, key: str) -> list:
     return result
 
 
-def _report_va_regression(summary: dict, fold_metrics: list, figures_dir: str) -> None:
-    """Prints and plots native VA regression metrics."""
-    print("\n=== VA Regression (native) ===")
+def _report_va_regression(summary: dict, fold_metrics: list, figures_dir: str, data_processed_dir: str) -> None:
+    """Prints, plots, and saves a full VA quality report (arousal + valence)."""
+    va_fig_dir = Path(figures_dir) / "va"
+    va_fig_dir.mkdir(parents=True, exist_ok=True)
+
+    report = build_va_evaluation_report(summary, fold_metrics)
+    print_va_evaluation_report(report)
+    json_path = save_va_evaluation_report(report, data_processed_dir)
+    print(f"\nVA evaluation report saved: {json_path}")
+
+    print("\n=== VA Regression (LOSO fold means from training) ===")
     va_keys = [
         "mae_arousal", "mae_valence",
         "rmse_arousal", "rmse_valence",
@@ -72,23 +87,41 @@ def _report_va_regression(summary: dict, fold_metrics: list, figures_dir: str) -
         mean_key = f"{key}_mean"
         std_key  = f"{key}_std"
         if mean_key in summary:
-            print(f"  {key}: {summary[mean_key]:.4f} ± {summary.get(std_key, 0.0):.4f}")
+            print(f"  {key}: {summary[mean_key]:.4f} +/- {summary.get(std_key, 0.0):.4f}")
 
     true_a = _collect_flat(fold_metrics, "true_arousal")
     true_v = _collect_flat(fold_metrics, "true_valence")
     pred_a = _collect_flat(fold_metrics, "pred_arousal")
     pred_v = _collect_flat(fold_metrics, "pred_valence")
 
-    if true_a and pred_a:
-        p = plot_va_scatter(true_a, pred_a, "Arousal", figures_dir)
-        print(f"Arousal scatter saved: {p}")
-    if true_v and pred_v:
-        p = plot_va_scatter(true_v, pred_v, "Valence", figures_dir)
-        print(f"Valence scatter saved: {p}")
+    if not true_a or not pred_a:
+        print("  No VA predictions in loso_results.pt — run step 05 with task.mode=regression_va.")
+        return
 
-    p = plot_va_metrics_bars(summary, figures_dir)
-    if p:
-        print(f"VA metrics bar chart saved: {p}")
+    pooled = report["pooled_loso_test"]
+    saved = []
+
+    for path_fn, args in [
+        (plot_va_scatter_with_stats, (true_a, pred_a, "Arousal", str(va_fig_dir))),
+        (plot_va_scatter_with_stats, (true_v, pred_v, "Valence", str(va_fig_dir))),
+        (plot_va_scatter, (true_a, pred_a, "Arousal", str(va_fig_dir))),
+        (plot_va_scatter, (true_v, pred_v, "Valence", str(va_fig_dir))),
+        (plot_va_error_histogram, (true_a, pred_a, "Arousal", str(va_fig_dir))),
+        (plot_va_error_histogram, (true_v, pred_v, "Valence", str(va_fig_dir))),
+        (plot_va_bland_altman, (true_a, pred_a, "Arousal", str(va_fig_dir))),
+        (plot_va_bland_altman, (true_v, pred_v, "Valence", str(va_fig_dir))),
+        (plot_va_combined_panel, (true_a, pred_a, true_v, pred_v, str(va_fig_dir))),
+        (plot_va_agreement_summary, (pooled, str(va_fig_dir))),
+        (plot_va_per_participant_ccc, (report["per_participant"], str(va_fig_dir))),
+        (plot_va_metrics_bars, (summary, str(va_fig_dir))),
+    ]:
+        p = path_fn(*args)
+        if p:
+            saved.append(p)
+
+    print(f"\nVA figures ({len(saved)} files) in: {va_fig_dir}")
+    for p in saved:
+        print(f"  {p}")
 
 
 def _report_binary_classification(
@@ -244,7 +277,7 @@ def main(cfg, compare_all: bool = False):
     Path(figures_dir).mkdir(parents=True, exist_ok=True)
 
     if task_mode == "regression_va":
-        _report_va_regression(summary, fold_metrics, figures_dir)
+        _report_va_regression(summary, fold_metrics, figures_dir, cfg.paths.data_processed)
         _report_binary_classification(
             summary, fold_metrics, figures_dir,
             title="Derived Binary Alarm (from VA predictions)",

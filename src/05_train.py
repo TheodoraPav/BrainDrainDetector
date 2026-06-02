@@ -87,14 +87,42 @@ def _training_use_amp(cfg, device: torch.device) -> bool:
     return device.type == "cuda" and bool(cfg.training.get("use_amp", False))
 
 
+def _resolve_va_loss_settings(cfg) -> dict:
+    """
+    Builds _VALoss kwargs from config.
+
+    training.weighted_loss=true on regression_va enables:
+      - va_loss_weights_weighted (default [1.5, 1.0] for arousal / valence heads)
+      - per-window sample weights for high arousal and low valence regions
+    """
+    loss_type = cfg.model.get("va_loss", "smooth_l1")
+    use_weighted_va = bool(cfg.training.get("weighted_loss", False))
+
+    if use_weighted_va:
+        dim_weights = list(cfg.model.get("va_loss_weights_weighted", [1.5, 1.0]))
+        sw_cfg = cfg.model.get("va_sample_weights", {})
+        use_sample_weights = bool(sw_cfg.get("enabled", True))
+    else:
+        dim_weights = list(cfg.model.get("va_loss_weights", [1.0, 1.0]))
+        sw_cfg = {}
+        use_sample_weights = False
+
+    return {
+        "loss_type": loss_type,
+        "weight_arousal": float(dim_weights[0]),
+        "weight_valence": float(dim_weights[1]),
+        "use_sample_weights": use_sample_weights,
+        "high_arousal_min": float(sw_cfg.get("high_arousal_min", 4.0)),
+        "low_valence_max": float(sw_cfg.get("low_valence_max", 3.0)),
+        "factor_high_arousal": float(sw_cfg.get("factor_high_arousal", 2.0)),
+        "factor_low_valence": float(sw_cfg.get("factor_low_valence", 2.0)),
+    }
+
+
 def _build_criterion(cfg, weights: torch.Tensor | None = None) -> nn.Module:
     """Returns the appropriate loss function for the active task mode."""
     if _task_mode(cfg) == "regression_va":
-        return _VALoss(
-            loss_type=cfg.model.get("va_loss", "smooth_l1"),
-            weight_arousal=cfg.model.va_loss_weights[0],
-            weight_valence=cfg.model.va_loss_weights[1],
-        )
+        return _VALoss(**_resolve_va_loss_settings(cfg))
     return nn.CrossEntropyLoss(weight=weights)
 
 
@@ -102,15 +130,54 @@ class _VALoss(nn.Module):
     """
     Combined VA regression loss.
 
-    Computes separate losses for arousal (column 0) and valence (column 1)
-    and returns the weighted sum: w_a * L_arousal + w_v * L_valence.
+    Computes separate per-dimension losses (arousal / valence) and combines them as
+    w_a * L_a + w_v * L_v. Optional per-window weights upweight stressful regions
+  (high arousal, low valence) when training.weighted_loss is enabled for regression_va.
     """
 
-    def __init__(self, loss_type: str = "smooth_l1", weight_arousal: float = 1.0, weight_valence: float = 1.0):
+    def __init__(
+        self,
+        loss_type: str = "smooth_l1",
+        weight_arousal: float = 1.0,
+        weight_valence: float = 1.0,
+        use_sample_weights: bool = False,
+        high_arousal_min: float = 4.0,
+        low_valence_max: float = 3.0,
+        factor_high_arousal: float = 2.0,
+        factor_low_valence: float = 2.0,
+    ):
         super().__init__()
-        self.loss_fn       = nn.SmoothL1Loss() if loss_type == "smooth_l1" else nn.MSELoss()
+        reduction = "none" if use_sample_weights else "mean"
+        if loss_type == "smooth_l1":
+            self.loss_fn = nn.SmoothL1Loss(reduction=reduction)
+        else:
+            self.loss_fn = nn.MSELoss(reduction=reduction)
         self.weight_arousal = weight_arousal
         self.weight_valence = weight_valence
+        self.use_sample_weights = use_sample_weights
+        self.high_arousal_min = high_arousal_min
+        self.low_valence_max = low_valence_max
+        self.factor_high_arousal = factor_high_arousal
+        self.factor_low_valence = factor_low_valence
+
+    def _per_window_weights(self, target: torch.Tensor) -> torch.Tensor:
+        """Higher weight for overload-like VA regions (A high, V low)."""
+        w = torch.ones(target.size(0), device=target.device, dtype=target.dtype)
+        arousal = target[:, 0]
+        valence = target[:, 1]
+        if self.factor_high_arousal > 1.0:
+            w = w * torch.where(
+                arousal >= self.high_arousal_min,
+                torch.full_like(w, self.factor_high_arousal),
+                torch.ones_like(w),
+            )
+        if self.factor_low_valence > 1.0:
+            w = w * torch.where(
+                valence <= self.low_valence_max,
+                torch.full_like(w, self.factor_low_valence),
+                torch.ones_like(w),
+            )
+        return w / w.mean().clamp(min=1e-6)
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """
@@ -120,6 +187,15 @@ class _VALoss(nn.Module):
         """
         l_arousal = self.loss_fn(pred[:, 0], target[:, 0])
         l_valence = self.loss_fn(pred[:, 1], target[:, 1])
+
+        if self.use_sample_weights:
+            sample_w = self._per_window_weights(target)
+            l_arousal = (l_arousal * sample_w).mean()
+            l_valence = (l_valence * sample_w).mean()
+        else:
+            l_arousal = l_arousal if l_arousal.dim() == 0 else l_arousal.mean()
+            l_valence = l_valence if l_valence.dim() == 0 else l_valence.mean()
+
         return self.weight_arousal * l_arousal + self.weight_valence * l_valence
 
 
@@ -328,6 +404,21 @@ def train_one_fold(
             "train_samples_per_participant": format_count_summary(count_values),
         })
         log_participant_counts("05", participant_counts, limit=0)
+
+    if task_mode == "regression_va" and cfg.training.get("weighted_loss", False):
+        va_loss_cfg = _resolve_va_loss_settings(cfg)
+        print("  VA weighted loss enabled:")
+        print(
+            f"    dimension weights (arousal, valence): "
+            f"{va_loss_cfg['weight_arousal']:.2f}, {va_loss_cfg['weight_valence']:.2f}"
+        )
+        if va_loss_cfg["use_sample_weights"]:
+            print(
+                f"    sample weights: arousal>={va_loss_cfg['high_arousal_min']:.0f} "
+                f"x{va_loss_cfg['factor_high_arousal']:.1f}, "
+                f"valence<={va_loss_cfg['low_valence_max']:.0f} "
+                f"x{va_loss_cfg['factor_low_valence']:.1f}"
+            )
 
     class_weights = None
     if _is_classification_task(task_mode) and cfg.training.get("weighted_loss", True):

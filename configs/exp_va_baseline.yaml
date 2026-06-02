@@ -14,6 +14,7 @@ task:
   mode: "regression_va"
 
 training:
+  weighted_loss: true             # [1.5, 1.0] head weights + stressful-window sample weights
   selection_metric: "ccc_mean"    # early stopping on (CCC_arousal + CCC_valence) / 2
 
 augmentation:

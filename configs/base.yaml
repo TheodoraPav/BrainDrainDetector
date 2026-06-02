@@ -74,7 +74,15 @@ model:
   # ── regression_va settings ─────────────────────────────────────────────────
   # Loss applied independently per head; combined as w_a * L_a + w_v * L_v.
   va_loss: "smooth_l1"          # "smooth_l1" | "mse"
-  va_loss_weights: [1.0, 1.0]   # [w_arousal, w_valence]
+  va_loss_weights: [1.0, 1.0]   # used when training.weighted_loss is false
+  # Used when task.mode=regression_va AND training.weighted_loss=true
+  va_loss_weights_weighted: [1.5, 1.0]
+  va_sample_weights:
+    enabled: true
+    high_arousal_min: 4        # true arousal >= this → multiply loss
+    low_valence_max: 3         # true valence <= this → multiply loss
+    factor_high_arousal: 2.0
+    factor_low_valence: 2.0
 
 # ============================================================
 # Training
@@ -87,7 +95,8 @@ training:
   seed: 42
   # Balanced sampling: K = median(n_i) per participant per epoch (see dataset.py)
   balanced_sampling: true
-  # Weighted loss for classification class imbalance (inverse frequency)
+  # classification: inverse-frequency CE weights (Safe vs Alarm)
+  # regression_va:  va_loss_weights_weighted + sample weights on A>=4, V<=3
   weighted_loss: true
   # Stop a fold when validation metric does not improve (0 = train all epochs).
   early_stopping_patience: 8
@@ -102,6 +111,18 @@ training:
   drop_waveform_after_embedding_cache: true
   # Mixed precision on CUDA (faster; no effect on CPU).
   use_amp: true
+
+# ============================================================
+# Threshold tuning (step 07 — no retraining)
+# ============================================================
+threshold_tuning:
+  # How to pick T on pooled LOSO test predictions:
+  #   max_f1 | max_recall | target_recall | youden
+  selection: "max_f1"
+  target_recall: 0.5       # used when selection = target_recall
+  min_precision: 0.0       # filter for max_recall / target_recall
+  num_steps: 37              # thresholds from 0.05 to 0.95
+  recover_probs: false       # rebuild pred_probs from checkpoints if missing
 
 # ============================================================
 # Augmentation — overridden per experiment
