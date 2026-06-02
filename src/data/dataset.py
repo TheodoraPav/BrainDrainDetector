@@ -181,7 +181,8 @@ def summarize_balanced_epoch(
 
     label_counts: Dict[int, int] = defaultdict(int)
     for idx in epoch_indices:
-        label_counts[train_samples[idx]["label"]] += 1
+        binary_label = merge_to_binary(int(train_samples[idx]["label"]))
+        label_counts[binary_label] += 1
 
     return {
         "k_cap": k_cap,

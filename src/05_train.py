@@ -400,7 +400,7 @@ def train_one_fold(
                         "k_cap", "epoch_samples", "epoch_batches", "batch_size",
                         "draws_per_participant_min", "draws_per_participant_median",
                         "draws_per_participant_max",
-                        "label_0_optimal", "label_1_overloaded", "label_2_grey",
+                        "label_safe", "label_alarm",
                     )},
                 })
                 log_participant_counts("05", epoch_stats["draws_by_participant"], limit=0)
