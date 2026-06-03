@@ -608,3 +608,71 @@ def plot_default_vs_tuned_metrics(
     fig.savefig(save_path, dpi=150)
     plt.close(fig)
     return str(save_path)
+
+
+def plot_derived_alarm_outcome_bars(
+    outcome_counts: Dict[str, int],
+    figures_dir: str,
+    filename: str = "derived_alarm_outcomes.png",
+) -> str:
+    """Bar chart of TP/TN/FP/FN from derived alarm vs GT."""
+    labels = ["Correct Alarm", "Correct Safe", "False Alarm", "Missed Alarm"]
+    codes = ["TP", "TN", "FP", "FN"]
+    colors = ["#2a9d8f", "#457b9d", "#e9c46a", "#e63946"]
+    values = [outcome_counts.get(c, 0) for c in codes]
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    bars = ax.bar(labels, values, color=colors, edgecolor="white")
+    ax.set_ylabel("Windows")
+    ax.set_title("Derived alarm from (â, v̂) — per-window outcomes (pooled LOSO)")
+    for bar, val in zip(bars, values):
+        if val > 0:
+            ax.text(bar.get_x() + bar.get_width() / 2, val, str(val), ha="center", va="bottom")
+    plt.xticks(rotation=12, ha="right")
+    plt.tight_layout()
+
+    save_path = _ensure_figures_dir(figures_dir) / filename
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
+    return str(save_path)
+
+
+def plot_derived_alarm_va_scatter(
+    window_rows: List[Dict],
+    figures_dir: str,
+    filename: str = "derived_alarm_pred_va_scatter.png",
+) -> str:
+    """Scatter of predicted (A, V) colored by alarm outcome (TP/TN/FP/FN)."""
+    if not window_rows:
+        return ""
+
+    outcome_colors = {"TP": "#2a9d8f", "TN": "#457b9d", "FP": "#e9c46a", "FN": "#e63946"}
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+    for code in ("TP", "TN", "FP", "FN"):
+        pts = [r for r in window_rows if r.get("outcome") == code]
+        if not pts:
+            continue
+        ax.scatter(
+            [r["pred_arousal"] for r in pts],
+            [r["pred_valence"] for r in pts],
+            c=outcome_colors[code],
+            label=f"{code} (n={len(pts)})",
+            alpha=0.55,
+            s=28,
+            edgecolors="white",
+            linewidths=0.3,
+        )
+    ax.set_xlabel("Predicted arousal")
+    ax.set_ylabel("Predicted valence")
+    ax.set_xlim(0.8, 5.2)
+    ax.set_ylim(0.8, 5.2)
+    ax.set_title("Predicted VA space — alarm correctness")
+    ax.grid(True, linestyle=":", alpha=0.5)
+    ax.legend(loc="best", fontsize=8)
+    plt.tight_layout()
+
+    save_path = _ensure_figures_dir(figures_dir) / filename
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
+    return str(save_path)

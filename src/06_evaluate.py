@@ -4,7 +4,7 @@ Step 6 — Evaluation and plot generation.
 Loads LOSO results from 05_train.py and generates figures and reports:
 
   classification       — Safe vs Alarm metrics, 2x2 CM, ROC, summary bars
-  regression_va          — Native VA metrics (CCC/MAE) + derived binary alarm
+  regression_va          — VA metrics + derived alarm correctness (â,v̂ → Safe/Alarm)
 
 Usage:
     python src/06_evaluate.py --config configs/exp_baseline.yaml
@@ -23,7 +23,20 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from utils.metrics import print_classification_report, average_metrics_across_folds
 from utils.pipeline_log import log_stats, stage_ok, stage_start
-from utils.va_report import build_va_evaluation_report, print_va_evaluation_report, save_va_evaluation_report
+from utils.va_report import (
+    build_single_dimension_evaluation_report,
+    build_va_evaluation_report,
+    print_single_dimension_evaluation_report,
+    print_va_evaluation_report,
+    save_single_dimension_evaluation_report,
+    save_va_evaluation_report,
+)
+from utils.derived_alarm_report import (
+    build_derived_alarm_report,
+    build_per_window_alarm_rows,
+    print_derived_alarm_report,
+    save_derived_alarm_report,
+)
 from utils.plotting import (
     plot_confusion_matrix,
     plot_f1_comparison,
@@ -37,23 +50,37 @@ from utils.plotting import (
     plot_va_per_participant_ccc,
     plot_va_scatter,
     plot_va_scatter_with_stats,
+    plot_derived_alarm_outcome_bars,
+    plot_derived_alarm_va_scatter,
 )
 
 
-def _detect_task_mode(fold_metrics: list) -> str:
-    """Infers task mode from the structure of the first fold's metrics dict."""
+def _detect_task_mode(fold_metrics: list, stored_mode: str | None = None) -> str:
+    """Infers task mode from saved metadata or fold metric keys."""
+    if stored_mode:
+        return stored_mode
     if not fold_metrics:
         return "classification"
     first = fold_metrics[0]
     if "ccc_arousal" in first or "mae_arousal" in first:
+        if "pred_valence" in first and "pred_arousal" in first:
+            return "regression_va"
+        if "pred_arousal" in first and "pred_valence" not in first:
+            return "regression_arousal"
+        if "pred_valence" in first and "pred_arousal" not in first:
+            return "regression_valence"
         return "regression_va"
     return "classification"
 
 
+def _is_va_evaluation_mode(task_mode: str) -> bool:
+    return task_mode in ("regression_va", "regression_va_separated")
+
+
 def load_experiment_summary(results_path: Path):
-    """Loads loso_results.pt and returns (summary, fold_metrics)."""
+    """Loads loso_results.pt and returns (summary, fold_metrics, task_mode)."""
     data = torch.load(results_path, weights_only=False)
-    return data["summary"], data["fold_metrics"]
+    return data["summary"], data["fold_metrics"], data.get("task_mode")
 
 
 def _collect_flat(fold_metrics: list, key: str) -> list:
@@ -122,6 +149,138 @@ def _report_va_regression(summary: dict, fold_metrics: list, figures_dir: str, d
     print(f"\nVA figures ({len(saved)} files) in: {va_fig_dir}")
     for p in saved:
         print(f"  {p}")
+
+
+def _report_va_single_dimension(
+    summary: dict,
+    fold_metrics: list,
+    dimension: str,
+    figures_dir: str,
+    data_processed_dir: str,
+) -> None:
+    """Full plots + JSON for one separated sub-run (arousal-only or valence-only)."""
+    dim_cap = dimension.capitalize()
+    fig_subdir = Path(figures_dir) / f"va_{dimension}"
+    fig_subdir.mkdir(parents=True, exist_ok=True)
+
+    report = build_single_dimension_evaluation_report(summary, fold_metrics, dimension)
+    print_single_dimension_evaluation_report(report)
+    json_path = save_single_dimension_evaluation_report(
+        report, data_processed_dir, dimension,
+    )
+    print(f"  Report saved: {json_path}")
+
+    true_vals = _collect_flat(fold_metrics, f"true_{dimension}")
+    pred_vals = _collect_flat(fold_metrics, f"pred_{dimension}")
+    if not true_vals or not pred_vals:
+        print(f"  No {dimension} predictions — skip figures.")
+        return
+
+    saved = []
+    for path_fn, args in [
+        (plot_va_scatter_with_stats, (true_vals, pred_vals, dim_cap, str(fig_subdir))),
+        (plot_va_scatter, (true_vals, pred_vals, dim_cap, str(fig_subdir))),
+        (plot_va_error_histogram, (true_vals, pred_vals, dim_cap, str(fig_subdir))),
+        (plot_va_bland_altman, (true_vals, pred_vals, dim_cap, str(fig_subdir))),
+    ]:
+        p = path_fn(*args)
+        if p:
+            saved.append(p)
+    print(f"  Figures ({len(saved)}) in: {fig_subdir}")
+
+
+def _report_separated_va_evaluation(
+    cfg,
+    figures_dir: str,
+    data_processed_dir: str,
+) -> None:
+    """
+    Three explicit evaluation blocks:
+      1) arousal-only model quality
+      2) valence-only model quality
+      3) combination (â from model A + v̂ from model B) → alarm / overload
+    """
+    data_proc = Path(data_processed_dir)
+    arousal_path = data_proc / "loso_results_arousal.pt"
+    valence_path = data_proc / "loso_results_valence.pt"
+    merged_path = data_proc / "loso_results.pt"
+
+    print("\n" + "=" * 60)
+    print("SEPARATED VA — (1/3) Arousal-only model")
+    print("=" * 60)
+    if arousal_path.is_file():
+        a_summary, a_folds, _ = load_experiment_summary(arousal_path)
+        _report_va_single_dimension(
+            a_summary, a_folds, "arousal", figures_dir, data_processed_dir,
+        )
+    else:
+        print(f"  Missing: {arousal_path}")
+
+    print("\n" + "=" * 60)
+    print("SEPARATED VA — (2/3) Valence-only model")
+    print("=" * 60)
+    if valence_path.is_file():
+        v_summary, v_folds, _ = load_experiment_summary(valence_path)
+        _report_va_single_dimension(
+            v_summary, v_folds, "valence", figures_dir, data_processed_dir,
+        )
+    else:
+        print(f"  Missing: {valence_path}")
+
+    print("\n" + "=" * 60)
+    print("SEPARATED VA — (3/3) Combination on your task (overload / alarm)")
+    print("  Uses pred_arousal from arousal model + pred_valence from valence model.")
+    print("  Merge is alignment only — not a third regression model.")
+    print("=" * 60)
+    if not merged_path.is_file():
+        print(f"  Missing merged results: {merged_path}")
+        return
+
+    c_summary, c_folds, _ = load_experiment_summary(merged_path)
+    _report_derived_alarm_from_va(
+        c_summary, c_folds, cfg, figures_dir, data_processed_dir,
+    )
+    _report_binary_classification(
+        c_summary, c_folds, figures_dir,
+        title="Combination: derived alarm (arousal pred + valence pred)",
+        cm_filename="confusion_matrix_combination_alarm.png",
+        roc_filename="roc_curve_combination_alarm.png",
+    )
+    plot_sample_participant_timelines(c_folds, figures_dir)
+
+
+def _report_derived_alarm_from_va(
+    summary: dict,
+    fold_metrics: list,
+    cfg,
+    figures_dir: str,
+    data_processed_dir: str,
+) -> None:
+    """
+    Evaluates whether derived Safe/Alarm from (â, v̂) matches GT overload.
+    Saves JSON + per-window CSV and outcome figures.
+    """
+    alarm_report = build_derived_alarm_report(fold_metrics, cfg, summary=summary)
+    if alarm_report.get("error"):
+        print(f"\n  Derived alarm report skipped: {alarm_report['error']}")
+        return
+
+    print_derived_alarm_report(alarm_report)
+    window_rows = build_per_window_alarm_rows(fold_metrics, cfg)
+    paths = save_derived_alarm_report(alarm_report, data_processed_dir, window_rows=window_rows)
+    print(f"\nDerived alarm report saved: {paths['json']}")
+    if "csv" in paths:
+        print(f"  Per-window CSV: {paths['csv']}")
+
+    alarm_fig_dir = Path(figures_dir) / "derived_alarm"
+    alarm_fig_dir.mkdir(parents=True, exist_ok=True)
+    counts = alarm_report["pooled_loso_test"].get("outcome_counts", {})
+    p1 = plot_derived_alarm_outcome_bars(counts, str(alarm_fig_dir))
+    p2 = plot_derived_alarm_va_scatter(window_rows, str(alarm_fig_dir))
+    if p1:
+        print(f"  Figure: {p1}")
+    if p2:
+        print(f"  Figure: {p2}")
 
 
 def _report_binary_classification(
@@ -262,10 +421,12 @@ def main(cfg, compare_all: bool = False):
     figures_dir  = cfg.paths.figures
 
     print(f"Loading results from {results_path}")
-    summary, fold_metrics = load_experiment_summary(results_path)
+    summary, fold_metrics, stored_mode = load_experiment_summary(results_path)
 
-    task_mode = _detect_task_mode(fold_metrics)
+    task_mode = _detect_task_mode(fold_metrics, stored_mode)
     print(f"Task mode detected: {task_mode}")
+    if task_mode == "regression_va_separated":
+        print("  (merged arousal + valence models — per-dimension VA + derived alarm)")
 
     log_stats("06", {
         "results_file":  str(results_path),
@@ -276,18 +437,23 @@ def main(cfg, compare_all: bool = False):
 
     Path(figures_dir).mkdir(parents=True, exist_ok=True)
 
-    if task_mode == "regression_va":
+    if task_mode == "regression_va_separated":
+        _report_separated_va_evaluation(cfg, figures_dir, cfg.paths.data_processed)
+    elif _is_va_evaluation_mode(task_mode):
         _report_va_regression(summary, fold_metrics, figures_dir, cfg.paths.data_processed)
+        _report_derived_alarm_from_va(
+            summary, fold_metrics, cfg, figures_dir, cfg.paths.data_processed,
+        )
         _report_binary_classification(
             summary, fold_metrics, figures_dir,
             title="Derived Binary Alarm (from VA predictions)",
             cm_filename="confusion_matrix_derived_binary.png",
             roc_filename="roc_curve_derived_binary.png",
         )
+        plot_sample_participant_timelines(fold_metrics, figures_dir)
     else:
         _report_binary_classification(summary, fold_metrics, figures_dir)
-
-    plot_sample_participant_timelines(fold_metrics, figures_dir)
+        plot_sample_participant_timelines(fold_metrics, figures_dir)
 
     if compare_all:
         config_map = {
@@ -304,7 +470,7 @@ def main(cfg, compare_all: bool = False):
             exp_cfg     = OmegaConf.load(cfg_path)
             exp_results = Path(exp_cfg.paths.data_processed) / "loso_results.pt"
             if exp_results.exists():
-                exp_summary, _ = load_experiment_summary(exp_results)
+                exp_summary, _, _ = load_experiment_summary(exp_results)
                 experiment_results[exp_name] = exp_summary
             else:
                 print(f"  Warning: results not found for {exp_name} at {exp_results}")

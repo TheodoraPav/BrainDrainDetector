@@ -88,6 +88,30 @@ def _compute_pcc(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return float(np.corrcoef(y_true, y_pred)[0, 1])
 
 
+def compute_scalar_regression_metrics(
+    true_vals: List[float],
+    pred_vals: List[float],
+    dimension: str,
+) -> Dict[str, float]:
+    """
+    Regression metrics for a single VA dimension (arousal or valence).
+
+    Returns keys: mae_{dim}, rmse_{dim}, pcc_{dim}, ccc_{dim}.
+    """
+    if dimension not in ("arousal", "valence"):
+        raise ValueError(f"dimension must be 'arousal' or 'valence', got {dimension!r}")
+
+    yt = np.array(true_vals, dtype=np.float64)
+    yp = np.array(pred_vals, dtype=np.float64)
+    ccc = _compute_ccc(yt, yp)
+    return {
+        f"mae_{dimension}":  round(float(np.mean(np.abs(yt - yp))), 4),
+        f"rmse_{dimension}": round(float(np.sqrt(np.mean((yt - yp) ** 2))), 4),
+        f"pcc_{dimension}":  round(_compute_pcc(yt, yp), 4),
+        f"ccc_{dimension}":  round(ccc, 4) if not np.isnan(ccc) else float("nan"),
+    }
+
+
 def compute_va_metrics(
     true_arousal:  List[float],
     true_valence:  List[float],

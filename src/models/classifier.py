@@ -5,8 +5,11 @@ Wires AudioEncoder + BiosignalEncoder + fusion layer + task head(s)
 into a single nn.Module.
 
 Task modes (set via cfg["task_mode"]):
-  "classification"  — nn.Linear(project_dim, 2) head (Safe / Alarm).
-  "regression_va"   — two independent Linear heads for arousal and valence.
+  "classification"       — nn.Linear(project_dim, 2) head (Safe / Alarm).
+  "regression_va"        — two Linear heads on one shared fusion (joint training).
+  "regression_arousal"   — one fusion + one head (arousal only).
+  "regression_valence"   — one fusion + one head (valence only).
+  Use task.mode regression_va_separated in config to run both separate models (step 05).
 
 Fusion mode (set via cfg["fusion_mode"]):
   "cross_attn_pooled"   — audio (1 token) attends over pooled biosignal token.
@@ -79,6 +82,8 @@ class BrainDrainDetector(nn.Module):
         if self.task_mode == "regression_va":
             self.head_arousal = nn.Linear(project_dim, 1)
             self.head_valence = nn.Linear(project_dim, 1)
+        elif self.task_mode in ("regression_arousal", "regression_valence"):
+            self.head = nn.Linear(project_dim, 1)
         else:
             self.head = nn.Linear(project_dim, cfg["num_classes"])
 
@@ -109,8 +114,9 @@ class BrainDrainDetector(nn.Module):
         fused = self.fusion(audio_emb, biosignal_output)
 
         if self.task_mode == "regression_va":
-            arousal = self.head_arousal(fused).squeeze(-1)        # (batch,)
-            valence = self.head_valence(fused).squeeze(-1)        # (batch,)
-            return torch.stack([arousal, valence], dim=1)         # (batch, 2)
-        else:
-            return self.head(fused)                               # (batch, num_classes)
+            arousal = self.head_arousal(fused).squeeze(-1)
+            valence = self.head_valence(fused).squeeze(-1)
+            return torch.stack([arousal, valence], dim=1)
+        if self.task_mode in ("regression_arousal", "regression_valence"):
+            return self.head(fused).squeeze(-1)
+        return self.head(fused)

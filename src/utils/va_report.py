@@ -13,7 +13,7 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 
-from .metrics import compute_va_metrics
+from .metrics import compute_scalar_regression_metrics, compute_va_metrics
 
 
 # Lin's CCC interpretation bands (common in affective computing reports)
@@ -153,6 +153,112 @@ def _recommendation(pooled: Dict[str, float]) -> Dict[str, str]:
             )
 
     return {"primary_focus_suggestion": primary, "notes": lines}
+
+
+def build_single_dimension_evaluation_report(
+    summary: dict,
+    fold_metrics: List[dict],
+    dimension: str,
+) -> dict:
+    """
+    VA report for one separated sub-run (arousal-only or valence-only model).
+    """
+    if dimension not in ("arousal", "valence"):
+        raise ValueError(f"dimension must be 'arousal' or 'valence', got {dimension!r}")
+
+    true_key = f"true_{dimension}"
+    pred_key = f"pred_{dimension}"
+    true_vals, pred_vals = [], []
+    per_pid = []
+
+    for fold in fold_metrics:
+        ta = fold.get(true_key, [])
+        pa = fold.get(pred_key, [])
+        if not ta or not pa:
+            continue
+        true_vals.extend(ta)
+        pred_vals.extend(pa)
+        m = compute_scalar_regression_metrics(
+            [float(x) for x in ta],
+            [float(x) for x in pa],
+            dimension,
+        )
+        m.update({
+            "participant": fold.get("participant", "?"),
+            "n_windows": len(ta),
+            f"ccc_{dimension}_label": interpret_ccc(m.get(f"ccc_{dimension}", float("nan"))),
+        })
+        per_pid.append(m)
+
+    pooled = compute_scalar_regression_metrics(
+        [float(x) for x in true_vals],
+        [float(x) for x in pred_vals],
+        dimension,
+    )
+    pooled[f"ccc_{dimension}_interpretation"] = interpret_ccc(
+        pooled.get(f"ccc_{dimension}", float("nan")),
+    )
+    yt = np.asarray(true_vals, dtype=np.float64)
+    pa = np.asarray(pred_vals, dtype=np.float64)
+    if len(yt) > 0:
+        pooled[f"within_1_{dimension}"] = round(float(np.mean(np.abs(yt - pa) <= 1.0)), 4)
+        pooled[f"rounded_acc_{dimension}"] = round(
+            float(np.mean(np.round(yt) == np.round(pa))), 4,
+        )
+        pooled[f"bias_{dimension}"] = round(float(np.mean(pa - yt)), 4)
+
+    prefix = f"{dimension}_only_model"
+    loso_keys = {k: v for k, v in summary.items() if dimension in k or k.startswith(("mae_", "rmse_", "pcc_", "ccc_"))}
+
+    return {
+        "evaluation_scope": prefix,
+        "dimension": dimension,
+        "pooled_loso_test": pooled,
+        "loso_summary_mean_std": loso_keys,
+        "per_participant": sorted(per_pid, key=lambda r: r["participant"]),
+        "reference_bands_ccc": [{"min": a, "max": b, "label": lbl} for a, b, lbl in CCC_BANDS],
+        "n_windows_pooled": len(true_vals),
+        "note": (
+            f"Metrics from the independent {dimension}-only LOSO run. "
+            "Alarm/combination metrics are in derived_alarm_evaluation_report.json."
+        ),
+    }
+
+
+def print_single_dimension_evaluation_report(report: dict) -> None:
+    """Console report for one separated sub-run."""
+    dim = report["dimension"].capitalize()
+    pooled = report["pooled_loso_test"]
+    print(f"\n=== {dim}-only model (separate training, pooled LOSO test) ===")
+    print(f"  Windows: {report['n_windows_pooled']}")
+    print(f"  MAE:  {pooled.get(f'mae_{report['dimension']}')}")
+    print(f"  RMSE: {pooled.get(f'rmse_{report['dimension']}')}")
+    print(f"  PCC:  {pooled.get(f'pcc_{report['dimension']}')}")
+    ccc = pooled.get(f"ccc_{report['dimension']}")
+    print(f"  CCC:  {ccc}  ({pooled.get(f'ccc_{report['dimension']}_interpretation')})")
+    w1 = pooled.get(f"within_1_{report['dimension']}")
+    if w1 is not None:
+        print(f"  Within +/-1: {w1 * 100:.1f}%")
+    print(f"  Bias (pred-true): {pooled.get(f'bias_{report['dimension']}')}")
+    print("  Per participant:")
+    for row in report.get("per_participant", []):
+        print(
+            f"    {row['participant']}: CCC={row.get(f'ccc_{report['dimension']}')} "
+            f"MAE={row.get(f'mae_{report['dimension']}')} n={row.get('n_windows')}"
+        )
+
+
+def save_single_dimension_evaluation_report(
+    report: dict,
+    output_dir: str | Path,
+    dimension: str,
+) -> Path:
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    json_path = output_dir / f"va_evaluation_report_{dimension}.json"
+    with json_path.open("w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2, default=str)
+    return json_path
 
 
 def build_va_evaluation_report(summary: dict, fold_metrics: List[dict]) -> dict:

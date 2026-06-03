@@ -71,6 +71,20 @@ class BrainDrainDataset(Dataset):
                 [float(sample["arousal"]), float(sample["valence"])],
                 dtype=torch.float32,
             )
+        elif self.task_mode == "regression_arousal":
+            if "arousal" not in sample:
+                raise KeyError(
+                    f"Sample {sample.get('participant', '?')} sec={sample.get('seconds', '?')} "
+                    "is missing arousal. Re-run step 01 then step 04."
+                )
+            target = torch.tensor(float(sample["arousal"]), dtype=torch.float32)
+        elif self.task_mode == "regression_valence":
+            if "valence" not in sample:
+                raise KeyError(
+                    f"Sample {sample.get('participant', '?')} sec={sample.get('seconds', '?')} "
+                    "is missing valence. Re-run step 01 then step 04."
+                )
+            target = torch.tensor(float(sample["valence"]), dtype=torch.float32)
         else:
             target = merge_to_binary(int(sample["label"]))
 

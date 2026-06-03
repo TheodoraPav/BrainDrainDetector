@@ -12,8 +12,9 @@ paths:
 # Task mode
 # ============================================================
 task:
-  # "classification" — 2-class CE (Safe=0, Alarm=1)  [default]
-  # "regression_va"    — predict Arousal + Valence directly (2 heads)
+  # "classification"            — 2-class CE (Safe=0, Alarm=1)  [default]
+  # "regression_va"             — joint A+V heads on shared fusion
+  # "regression_va_separated"   — two independent models, merged eval + alarm
   mode: "classification"
 
   # Store raw arousal + valence in each window tensor during step 04.

@@ -1,0 +1,13 @@
+# One-off local run: tune alarm threshold for recall >= 0.5
+paths:
+  data_raw: "Data"
+  data_processed: "data_processed"
+  figures: "figures_threshold_target_recall"
+  checkpoints: "checkpoints"
+
+threshold_tuning:
+  selection: "target_recall"
+  target_recall: 0.5
+  min_precision: 0.0
+  num_steps: 37
+  recover_probs: false

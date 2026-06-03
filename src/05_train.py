@@ -10,12 +10,16 @@ For each participant:
 
 Task modes (set via cfg.task.mode):
   "classification" — 2-class Safe/Alarm CE, early stopping on recall_alarm.
-  "regression_va"  — predict Arousal + Valence, early stopping on ccc_mean.
+  "regression_va"           — joint A+V heads, early stopping on ccc_mean.
+  "regression_va_separated" — two independent models (arousal + valence), merged eval.
+  "regression_arousal"      — single arousal head (internal sub-run).
+  "regression_valence"      — single valence head (internal sub-run).
 
 Usage:
     python src/05_train.py --config configs/exp_baseline.yaml
     python src/05_train.py --config configs/exp_offline_aug.yaml
     python src/05_train.py --config configs/exp_va_baseline.yaml
+    python src/05_train.py --config configs/exp_va_separated.yaml
 """
 
 import argparse
@@ -50,16 +54,22 @@ from data.dataset import (
 )
 from utils.metrics import (
     compute_va_metrics,
+    compute_scalar_regression_metrics,
     compute_binary_alarm_metrics,
     average_metrics_across_folds,
 )
 from utils.labels import merge_to_binary
 from utils.derived_eval import evaluate_derived_binary_from_va
+from utils.va_separated import merge_separated_fold_metrics, build_merged_summary
 from utils.early_stopping import early_stopping_should_stop, update_validation_score
 from utils.pipeline_log import format_count_summary, log_participant_counts, log_stats, stage_ok, stage_start
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+_SCALAR_REGRESSION_MODES = ("regression_arousal", "regression_valence")
+_REGRESSION_TASK_MODES = ("regression_va",) + _SCALAR_REGRESSION_MODES
+
 
 def _task_mode(cfg) -> str:
     return cfg.task.mode
@@ -67,6 +77,35 @@ def _task_mode(cfg) -> str:
 
 def _is_classification_task(task_mode: str) -> bool:
     return task_mode == "classification"
+
+
+def _is_scalar_regression_task(task_mode: str) -> bool:
+    return task_mode in _SCALAR_REGRESSION_MODES
+
+
+def _is_any_regression_task(task_mode: str) -> bool:
+    return task_mode in _REGRESSION_TASK_MODES
+
+
+def _separated_checkpoint_dir(cfg, subtask: str) -> str:
+    sep = cfg.task.get("separated", {})
+    custom = sep.get(f"checkpoints_{subtask}")
+    if custom:
+        return str(custom)
+    base = Path(cfg.paths.checkpoints)
+    return str(base.parent / f"{base.name}_{subtask}")
+
+
+def _cfg_for_separated_subtask(cfg, subtask: str):
+    """Clone config for one separated sub-run (arousal or valence)."""
+    cfg_sub = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
+    cfg_sub.task.mode = f"regression_{subtask}"
+    cfg_sub.paths.checkpoints = _separated_checkpoint_dir(cfg, subtask)
+    sep = cfg.task.get("separated", {})
+    cfg_sub.training.selection_metric = sep.get(
+        f"selection_metric_{subtask}", f"ccc_{subtask}",
+    )
+    return cfg_sub
 
 
 def _selection_metric(cfg) -> str:
@@ -119,10 +158,32 @@ def _resolve_va_loss_settings(cfg) -> dict:
     }
 
 
+def _resolve_single_target_loss_settings(cfg, dimension: str) -> dict:
+    """Sample weights for separated runs: arousal high-A only, valence low-V only."""
+    loss_type = cfg.model.get("va_loss", "smooth_l1")
+    use_weighted = bool(cfg.training.get("weighted_loss", False))
+    sw_cfg = cfg.model.get("va_sample_weights", {})
+    use_sample_weights = use_weighted and bool(sw_cfg.get("enabled", True))
+    return {
+        "loss_type": loss_type,
+        "dimension": dimension,
+        "use_sample_weights": use_sample_weights,
+        "high_arousal_min": float(sw_cfg.get("high_arousal_min", 4.0)),
+        "low_valence_max": float(sw_cfg.get("low_valence_max", 3.0)),
+        "factor_high_arousal": float(sw_cfg.get("factor_high_arousal", 2.0)),
+        "factor_low_valence": float(sw_cfg.get("factor_low_valence", 2.0)),
+    }
+
+
 def _build_criterion(cfg, weights: torch.Tensor | None = None) -> nn.Module:
     """Returns the appropriate loss function for the active task mode."""
-    if _task_mode(cfg) == "regression_va":
+    task_mode = _task_mode(cfg)
+    if task_mode == "regression_va":
         return _VALoss(**_resolve_va_loss_settings(cfg))
+    if task_mode == "regression_arousal":
+        return _SingleTargetLoss(**_resolve_single_target_loss_settings(cfg, "arousal"))
+    if task_mode == "regression_valence":
+        return _SingleTargetLoss(**_resolve_single_target_loss_settings(cfg, "valence"))
     return nn.CrossEntropyLoss(weight=weights)
 
 
@@ -197,6 +258,58 @@ class _VALoss(nn.Module):
             l_valence = l_valence if l_valence.dim() == 0 else l_valence.mean()
 
         return self.weight_arousal * l_arousal + self.weight_valence * l_valence
+
+
+class _SingleTargetLoss(nn.Module):
+    """Scalar regression loss for separated arousal-only or valence-only training."""
+
+    def __init__(
+        self,
+        loss_type: str = "smooth_l1",
+        dimension: str = "arousal",
+        use_sample_weights: bool = False,
+        high_arousal_min: float = 4.0,
+        low_valence_max: float = 3.0,
+        factor_high_arousal: float = 2.0,
+        factor_low_valence: float = 2.0,
+    ):
+        super().__init__()
+        if dimension not in ("arousal", "valence"):
+            raise ValueError(f"dimension must be arousal or valence, got {dimension!r}")
+        reduction = "none" if use_sample_weights else "mean"
+        if loss_type == "smooth_l1":
+            self.loss_fn = nn.SmoothL1Loss(reduction=reduction)
+        else:
+            self.loss_fn = nn.MSELoss(reduction=reduction)
+        self.dimension = dimension
+        self.use_sample_weights = use_sample_weights
+        self.high_arousal_min = high_arousal_min
+        self.low_valence_max = low_valence_max
+        self.factor_high_arousal = factor_high_arousal
+        self.factor_low_valence = factor_low_valence
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        pred = pred.view(-1)
+        target = target.view(-1).float()
+        loss = self.loss_fn(pred, target)
+        if not self.use_sample_weights:
+            return loss if loss.dim() == 0 else loss.mean()
+
+        w = torch.ones(target.size(0), device=target.device, dtype=target.dtype)
+        if self.dimension == "arousal" and self.factor_high_arousal > 1.0:
+            w = w * torch.where(
+                target >= self.high_arousal_min,
+                torch.full_like(w, self.factor_high_arousal),
+                torch.ones_like(w),
+            )
+        elif self.dimension == "valence" and self.factor_low_valence > 1.0:
+            w = w * torch.where(
+                target <= self.low_valence_max,
+                torch.full_like(w, self.factor_low_valence),
+                torch.ones_like(w),
+            )
+        w = w / w.mean().clamp(min=1e-6)
+        return (loss * w).mean()
 
 
 # ── Audio embedding cache ─────────────────────────────────────────────────────
@@ -306,6 +419,9 @@ def run_one_epoch(
             if task_mode == "regression_va":
                 all_preds.extend(output.detach().cpu().tolist())
                 all_labels.extend(targets.cpu().tolist())
+            elif _is_scalar_regression_task(task_mode):
+                all_preds.extend(output.detach().cpu().tolist())
+                all_labels.extend(targets.cpu().tolist())
             else:
                 probs = torch.softmax(output, dim=1)
                 all_probs.extend(probs.detach().cpu().tolist())
@@ -326,9 +442,14 @@ def _compute_epoch_score(all_labels, all_preds, task_mode: str, selection_metric
         pred_v = [p[1] for p in all_preds]
         va_m = compute_va_metrics(true_a, true_v, pred_a, pred_v)
         score = va_m.get(selection_metric, va_m["ccc_mean"])
-        return 0.0 if (score is None or (isinstance(score, float) and score != score)) else float(score)
-    m = compute_binary_alarm_metrics(all_labels, all_preds)
-    return float(m.get(selection_metric, m["recall_alarm"]))
+    elif _is_scalar_regression_task(task_mode):
+        dim = "arousal" if task_mode == "regression_arousal" else "valence"
+        m = compute_scalar_regression_metrics(all_labels, all_preds, dim)
+        score = m.get(selection_metric, m[f"ccc_{dim}"])
+    else:
+        m = compute_binary_alarm_metrics(all_labels, all_preds)
+        score = m.get(selection_metric, m["recall_alarm"])
+    return 0.0 if (score is None or (isinstance(score, float) and score != score)) else float(score)
 
 
 # ── Per-fold training ─────────────────────────────────────────────────────────
@@ -419,6 +540,22 @@ def train_one_fold(
                 f"valence<={va_loss_cfg['low_valence_max']:.0f} "
                 f"x{va_loss_cfg['factor_low_valence']:.1f}"
             )
+    elif _is_scalar_regression_task(task_mode) and cfg.training.get("weighted_loss", False):
+        st_cfg = _resolve_single_target_loss_settings(
+            cfg, "arousal" if task_mode == "regression_arousal" else "valence",
+        )
+        print(f"  {st_cfg['dimension']} weighted loss enabled:")
+        if st_cfg["use_sample_weights"]:
+            if st_cfg["dimension"] == "arousal":
+                print(
+                    f"    sample weights: arousal>={st_cfg['high_arousal_min']:.0f} "
+                    f"x{st_cfg['factor_high_arousal']:.1f}"
+                )
+            else:
+                print(
+                    f"    sample weights: valence<={st_cfg['low_valence_max']:.0f} "
+                    f"x{st_cfg['factor_low_valence']:.1f}"
+                )
 
     class_weights = None
     if _is_classification_task(task_mode) and cfg.training.get("weighted_loss", True):
@@ -593,6 +730,20 @@ def _build_fold_metrics(final_labels, final_preds, final_probs, participant, tas
             if true_labels:
                 derived = evaluate_derived_binary_from_va(pred_a, pred_v, true_labels, cfg)
                 base.update(derived)
+    elif _is_scalar_regression_task(task_mode):
+        dim = "arousal" if task_mode == "regression_arousal" else "valence"
+        true_vals = [float(x) for x in final_labels]
+        pred_vals = [float(x) for x in final_preds]
+        base.update(compute_scalar_regression_metrics(true_vals, pred_vals, dim))
+        if dim == "arousal":
+            base["true_arousal"] = true_vals
+            base["pred_arousal"] = pred_vals
+        else:
+            base["true_valence"] = true_vals
+            base["pred_valence"] = pred_vals
+        gt_labels = [int(s["label"]) for s in _get_test_samples_for_labels(participant, cfg)]
+        if gt_labels:
+            base["true_labels_3class"] = gt_labels
     else:
         binary_m = compute_binary_alarm_metrics(final_labels, final_preds)
         base.update(binary_m)
@@ -623,25 +774,65 @@ def _get_test_samples_for_labels(test_participant: str, cfg) -> list:
 
 # ── Result persistence ────────────────────────────────────────────────────────
 
-def _save_loso_results(cfg, all_fold_metrics: list) -> Path:
-    summary = average_metrics_across_folds(all_fold_metrics)
+def _fold_metrics_have_predictions(fold_metrics: list) -> bool:
+    if not fold_metrics:
+        return False
+    first = fold_metrics[0]
+    return bool(
+        ("true_labels" in first and "pred_labels" in first)
+        or ("true_arousal" in first and "pred_arousal" in first)
+        or ("true_valence" in first and "pred_valence" in first)
+    )
+
+
+def _save_loso_results(
+    cfg,
+    all_fold_metrics: list,
+    results_filename: str = "loso_results.pt",
+    extra_meta: dict | None = None,
+) -> Path:
+    task_mode = _task_mode(cfg)
+    if task_mode == "regression_va_separated":
+        summary = build_merged_summary(all_fold_metrics)
+    else:
+        summary = average_metrics_across_folds(all_fold_metrics)
 
     print(f"\n{'='*60}")
-    print("LOSO Summary:")
+    print(f"LOSO Summary ({results_filename}):")
     for key, value in summary.items():
         print(f"  {key}: {value}")
 
-    results_path = Path(cfg.paths.data_processed) / "loso_results.pt"
-    torch.save({"fold_metrics": all_fold_metrics, "summary": summary}, results_path)
+    results_path = Path(cfg.paths.data_processed) / results_filename
+    payload = {
+        "fold_metrics": all_fold_metrics,
+        "summary": summary,
+        "task_mode": task_mode,
+    }
+    if extra_meta:
+        payload.update(extra_meta)
+    torch.save(payload, results_path)
 
     log_stats("05", {
         "folds_completed": len(all_fold_metrics),
         "results_file":    str(results_path),
+        "task_mode":       task_mode,
         **{f"summary_{k}": round(v, 4) if isinstance(v, float) else v for k, v in summary.items()},
     })
     stage_ok("05", f"LOSO complete — {len(all_fold_metrics)} folds, results in {results_path}")
     print(f"\nResults saved to {results_path}")
     return results_path
+
+
+def _load_loso_fold_metrics(cfg, results_filename: str) -> list | None:
+    results_path = Path(cfg.paths.data_processed) / results_filename
+    if not results_path.is_file():
+        return None
+    data = torch.load(results_path, weights_only=False)
+    fold_metrics = data.get("fold_metrics", [])
+    if _fold_metrics_have_predictions(fold_metrics):
+        print(f"Reusing existing LOSO results: {results_path}")
+        return fold_metrics
+    return None
 
 
 # ── Checkpoint recovery ───────────────────────────────────────────────────────
@@ -718,79 +909,45 @@ def _configure_cuda_backend() -> None:
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-def main(cfg):
-    global _SAMPLES_CACHE
-
-    stage_start("05", "LOSO training")
-    torch.manual_seed(cfg.training.seed)
-    _configure_cuda_backend()
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-
-    task_mode = _task_mode(cfg)
-    print(f"Task mode: {task_mode}")
-
-    windows_dir = "windows_aug" if cfg.augmentation.enabled else "windows"
-    samples = load_all_samples(str(Path(cfg.paths.data_processed) / windows_dir))
-    _SAMPLES_CACHE = samples
-
-    participant_ids = get_all_participant_ids(samples)
-    per_participant_counts = count_samples_per_participant(samples)
-
-    log_stats("05", {
-        "device":             str(device),
-        "task_mode":          task_mode,
-        "selection_metric":   _selection_metric(cfg),
-        "windows_dir":        windows_dir,
-        "total_samples":      len(samples),
-        "participants":       len(participant_ids),
-        "samples_per_participant": format_count_summary(per_participant_counts.values()),
-        "balanced_sampling":  cfg.training.get("balanced_sampling", True),
-        "batch_size":         cfg.training.batch_size,
-        "epochs":             cfg.training.epochs,
-        "early_stopping_patience": cfg.training.get("early_stopping_patience", 0),
-        "cache_audio_embeddings": cfg.training.get("cache_audio_embeddings", False),
-        "use_amp":            cfg.training.get("use_amp", False),
-        "fusion_mode":        cfg.model.get("fusion_mode", "cross_attn_pooled"),
-    })
-
-    print(f"Loaded {len(samples)} total windows from {windows_dir}/.")
-
-    if not samples:
-        raise RuntimeError(
-            f"No training samples found in {Path(cfg.paths.data_processed) / windows_dir}. "
-            "Step 04 likely saved 0 windows — check step 03 (physio) output first."
-        )
-
-    if task_mode == "regression_va":
-        missing_av = [s for s in samples if "arousal" not in s or "valence" not in s]
-        if missing_av:
+def _validate_regression_samples(samples: list, task_mode: str) -> None:
+    if task_mode in ("regression_va", "regression_va_separated"):
+        missing = [s for s in samples if "arousal" not in s or "valence" not in s]
+        if missing:
             raise RuntimeError(
-                f"{len(missing_av)} window tensor(s) are missing arousal/valence fields. "
-                "Re-run step 01 (generates annotations.csv) then step 04 to rebuild tensors."
+                f"{len(missing)} window tensor(s) are missing arousal/valence fields. "
+                "Re-run step 01 then step 04 to rebuild tensors."
             )
+    elif task_mode == "regression_arousal":
+        missing = [s for s in samples if "arousal" not in s]
+        if missing:
+            raise RuntimeError(f"{len(missing)} windows missing arousal.")
+    elif task_mode == "regression_valence":
+        missing = [s for s in samples if "valence" not in s]
+        if missing:
+            raise RuntimeError(f"{len(missing)} windows missing valence.")
 
-    print(f"Running LOSO cross-validation over {len(participant_ids)} participants.")
 
-    results_path = Path(cfg.paths.data_processed) / "loso_results.pt"
-    if results_path.is_file():
+def _run_loso_training(
+    cfg,
+    samples: list,
+    participant_ids: list,
+    device: torch.device,
+    results_filename: str = "loso_results.pt",
+) -> list:
+    """Full LOSO loop for one task mode; returns fold_metrics list."""
+    task_mode = _task_mode(cfg)
+    results_path = Path(cfg.paths.data_processed) / results_filename
+
+    existing = _load_loso_fold_metrics(cfg, results_filename)
+    if existing is not None:
         data = torch.load(results_path, weights_only=False)
-        fold_metrics_existing = data.get("fold_metrics", [])
-        has_preds = bool(
-            fold_metrics_existing
-            and (
-                ("true_labels" in fold_metrics_existing[0] and "pred_labels" in fold_metrics_existing[0])
-                or ("true_arousal" in fold_metrics_existing[0])
-            )
-        )
-        if has_preds:
-            print(f"LOSO results already exist: {results_path}")
-            for key, value in data["summary"].items():
-                print(f"  {key}: {value}")
-            stage_ok("05", f"skipped — results already at {results_path}")
-            return
-        print(f"LOSO results at {results_path} lack prediction lists — re-running recovery for plots.")
+        for key, value in data.get("summary", {}).items():
+            print(f"  {key}: {value}")
+        stage_ok("05", f"skipped — results already at {results_path}")
+        return existing
+
+    if results_path.is_file():
+        print(f"LOSO results at {results_path} lack prediction lists — re-running.")
 
     shared_audio_encoder = None
     if cfg.model.get("audio_encoder", "wav2vec2") == "wav2vec2":
@@ -831,11 +988,10 @@ def main(cfg):
         cfg, device, samples, participant_ids, shared_audio_encoder,
     )
     if recovered is not None:
-        _save_loso_results(cfg, recovered)
-        return
+        _save_loso_results(cfg, recovered, results_filename=results_filename)
+        return recovered
 
     all_fold_metrics = []
-
     for test_participant in participant_ids:
         train_samples, test_samples = build_loso_splits(samples, test_participant)
         print(f"\n{'='*60}")
@@ -850,7 +1006,129 @@ def main(cfg):
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
-    _save_loso_results(cfg, all_fold_metrics)
+    _save_loso_results(cfg, all_fold_metrics, results_filename=results_filename)
+    return all_fold_metrics
+
+
+def _main_regression_va_separated(cfg) -> None:
+    """Two independent LOSO runs (arousal + valence), then merge for alarm metrics."""
+    global _SAMPLES_CACHE
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    windows_dir = "windows_aug" if cfg.augmentation.enabled else "windows"
+    samples = load_all_samples(str(Path(cfg.paths.data_processed) / windows_dir))
+    _SAMPLES_CACHE = samples
+    participant_ids = get_all_participant_ids(samples)
+    _validate_regression_samples(samples, "regression_va_separated")
+
+    merged_path = Path(cfg.paths.data_processed) / "loso_results.pt"
+    if merged_path.is_file():
+        data = torch.load(merged_path, weights_only=False)
+        if data.get("task_mode") == "regression_va_separated" and _fold_metrics_have_predictions(
+            data.get("fold_metrics", []),
+        ):
+            print(f"Merged separated results already exist: {merged_path}")
+            for key, value in data.get("summary", {}).items():
+                print(f"  {key}: {value}")
+            stage_ok("05", f"skipped — merged results at {merged_path}")
+            return
+
+    print("\n" + "=" * 60)
+    print("Separated VA — sub-run 1/2: arousal-only model")
+    print("=" * 60)
+    cfg_a = _cfg_for_separated_subtask(cfg, "arousal")
+    arousal_folds = _run_loso_training(
+        cfg_a, samples, participant_ids, device,
+        results_filename="loso_results_arousal.pt",
+    )
+
+    print("\n" + "=" * 60)
+    print("Separated VA — sub-run 2/2: valence-only model")
+    print("=" * 60)
+    cfg_v = _cfg_for_separated_subtask(cfg, "valence")
+    valence_folds = _run_loso_training(
+        cfg_v, samples, participant_ids, device,
+        results_filename="loso_results_valence.pt",
+    )
+
+    print("\n" + "=" * 60)
+    print("Aligning arousal + valence preds for COMBINATION eval (alarm / overload)")
+    print("  Per-dimension metrics: see loso_results_arousal.pt / loso_results_valence.pt")
+    print("=" * 60)
+    merged_folds = merge_separated_fold_metrics(arousal_folds, valence_folds, cfg)
+    _save_loso_results(
+        cfg,
+        merged_folds,
+        results_filename="loso_results.pt",
+        extra_meta={
+            "task_mode": "regression_va_separated",
+            "sub_results": {
+                "arousal": "loso_results_arousal.pt",
+                "valence": "loso_results_valence.pt",
+            },
+        },
+    )
+
+
+def main(cfg):
+    global _SAMPLES_CACHE
+
+    stage_start("05", "LOSO training")
+    torch.manual_seed(cfg.training.seed)
+    _configure_cuda_backend()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    task_mode = _task_mode(cfg)
+    print(f"Task mode: {task_mode}")
+
+    if task_mode == "regression_va_separated":
+        log_stats("05", {
+            "device": str(device),
+            "task_mode": task_mode,
+            "weighted_loss": cfg.training.get("weighted_loss", False),
+        })
+        _main_regression_va_separated(cfg)
+        return
+
+    windows_dir = "windows_aug" if cfg.augmentation.enabled else "windows"
+    samples = load_all_samples(str(Path(cfg.paths.data_processed) / windows_dir))
+    _SAMPLES_CACHE = samples
+
+    participant_ids = get_all_participant_ids(samples)
+    per_participant_counts = count_samples_per_participant(samples)
+
+    log_stats("05", {
+        "device":             str(device),
+        "task_mode":          task_mode,
+        "selection_metric":   _selection_metric(cfg),
+        "windows_dir":        windows_dir,
+        "total_samples":      len(samples),
+        "participants":       len(participant_ids),
+        "samples_per_participant": format_count_summary(per_participant_counts.values()),
+        "balanced_sampling":  cfg.training.get("balanced_sampling", True),
+        "batch_size":         cfg.training.batch_size,
+        "epochs":             cfg.training.epochs,
+        "early_stopping_patience": cfg.training.get("early_stopping_patience", 0),
+        "cache_audio_embeddings": cfg.training.get("cache_audio_embeddings", False),
+        "use_amp":            cfg.training.get("use_amp", False),
+        "fusion_mode":        cfg.model.get("fusion_mode", "cross_attn_pooled"),
+    })
+
+    print(f"Loaded {len(samples)} total windows from {windows_dir}/.")
+
+    if not samples:
+        raise RuntimeError(
+            f"No training samples found in {Path(cfg.paths.data_processed) / windows_dir}. "
+            "Step 04 likely saved 0 windows — check step 03 (physio) output first."
+        )
+
+    if _is_any_regression_task(task_mode):
+        _validate_regression_samples(samples, task_mode)
+
+    print(f"Running LOSO cross-validation over {len(participant_ids)} participants.")
+    _run_loso_training(cfg, samples, participant_ids, device)
 
 
 if __name__ == "__main__":
