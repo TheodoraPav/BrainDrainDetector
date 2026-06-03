@@ -705,7 +705,9 @@ def train_one_fold(
             epoch_score, best_score, epochs_without_improvement,
         )
         if improved or epochs_run == 1:
-            torch.save(model.state_dict(), best_ckpt_path)
+            # Save only non-audio_encoder parameters to save space since audio backbone is frozen
+            state_dict = {k: v for k, v in model.state_dict().items() if not k.startswith("audio_encoder.")}
+            torch.save(state_dict, best_ckpt_path)
 
         if early_stopping_should_stop(epochs_run, epochs_without_improvement, patience, min_epochs):
             print(
@@ -718,7 +720,7 @@ def train_one_fold(
             })
             break
 
-    model.load_state_dict(torch.load(best_ckpt_path, weights_only=True))
+    model.load_state_dict(torch.load(best_ckpt_path, weights_only=True), strict=False)
     _, final_labels, final_preds, final_probs = run_one_epoch(
         model, test_loader, criterion, None, device,
         is_training=False, task_mode=task_mode, use_amp=use_amp,
@@ -909,7 +911,7 @@ def _evaluate_fold_checkpoint(
 ) -> dict:
     ckpt_path = Path(cfg.paths.checkpoints) / f"best_{test_participant}.pt"
     model = BrainDrainDetector(_build_model_cfg(cfg), shared_audio_encoder=shared_audio_encoder).to(device)
-    model.load_state_dict(torch.load(ckpt_path, weights_only=True))
+    model.load_state_dict(torch.load(ckpt_path, weights_only=True), strict=False)
 
     task_mode = _task_mode(cfg)
     criterion = _build_criterion(cfg)

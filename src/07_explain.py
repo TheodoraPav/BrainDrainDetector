@@ -134,7 +134,7 @@ def main(cfg):
         test_loader     = DataLoader(test_dataset, batch_size=8, shuffle=False, num_workers=0)
 
         model = BrainDrainDetector(dict(cfg.model)).to(device)
-        model.load_state_dict(torch.load(ckpt_path, weights_only=True, map_location=device))
+        model.load_state_dict(torch.load(ckpt_path, weights_only=True, map_location=device), strict=False)
 
         # Use the first batch for visualization.
         first_batch       = next(iter(test_loader))
