@@ -1,7 +1,7 @@
 """
 Derived binary alarm evaluation from VA predictions (â, v̂).
 
-After regression_va or regression_va_separated, each window gets a predicted
+After regression_va or va_separated_classify (merged High/Low preds), each window gets a predicted
 Safe/Alarm via the same VA rules used at label time. This module reports whether
 that derived alarm matches ground-truth overload (per window and pooled).
 """
@@ -26,6 +26,11 @@ OUTCOME_LABELS = {
 }
 
 
+def _fold_true_alarm_labels(fold: dict) -> list | None:
+    """GT Safe/Alarm per test window. Accepts legacy ``true_labels_3class`` in old checkpoints."""
+    return fold.get("true_alarm_labels") or fold.get("true_labels_3class")
+
+
 def alarm_outcome(true_alarm: int, pred_alarm: int) -> str:
     """Confusion cell for one window."""
     t, p = int(true_alarm), int(pred_alarm)
@@ -45,8 +50,9 @@ def _label_rules_snapshot(cfg) -> dict:
         "overloaded_max_valence": int(labels.overloaded_max_valence),
         "optimal_min_valence": int(labels.optimal_min_valence),
         "optimal_max_arousal": int(labels.optimal_max_arousal),
+        "high_low_bins": "Low=1-3, High=4-5",
         "description": (
-            "Alarm = predicted Overloaded: "
+            "Alarm from High/Low class preds (proxy A,V) then overload rule: "
             f"V <= {labels.overloaded_max_valence} AND A >= {labels.overloaded_min_arousal}"
         ),
     }
@@ -61,25 +67,52 @@ def build_per_window_alarm_rows(fold_metrics: List[dict], cfg) -> List[dict]:
         pid = fold.get("participant", "?")
         pa = fold.get("pred_arousal", [])
         pv = fold.get("pred_valence", [])
+        pa_hl = fold.get("pred_arousal_hl", [])
+        pv_hl = fold.get("pred_valence_hl", [])
+        alarm_probs = fold.get("pred_alarm_probs", [])
         ta = fold.get("true_arousal", [])
         tv = fold.get("true_valence", [])
 
         true_bin = fold.get("true_binary")
         pred_bin = fold.get("pred_binary")
-        true_lbls = fold.get("true_labels_3class")
+        true_lbls = fold.get("true_alarm_labels") or fold.get("true_labels_3class")
 
-        if not pa or not pv:
+        if pa_hl and pv_hl:
+            n = len(pa_hl)
+            if pred_bin is None and true_lbls and len(true_lbls) == n:
+                from .labels import derive_alarm_from_high_low
+
+                true_bin = [merge_to_binary(int(x)) for x in true_lbls]
+                pred_bin = [
+                    derive_alarm_from_high_low(int(a), int(v), cfg)
+                    for a, v in zip(pa_hl, pv_hl)
+                ]
+            if not pa and n:
+                from .labels import high_low_to_va_proxy
+
+                pa = [high_low_to_va_proxy(int(a), 0, cfg)[0] for a in pa_hl]
+                pv = [high_low_to_va_proxy(0, int(v), cfg)[1] for v in pv_hl]
+        elif not pa or not pv:
             continue
+        else:
+            n = len(pa)
 
-        n = len(pa)
         if true_bin is None or pred_bin is None:
             if not true_lbls or len(true_lbls) != n:
                 continue
             true_bin = [merge_to_binary(int(x)) for x in true_lbls]
-            pred_bin = [
-                derive_binary_from_va(float(a), float(v), cfg.labels)
-                for a, v in zip(pa, pv)
-            ]
+            if pa_hl and pv_hl:
+                from .labels import derive_alarm_from_high_low
+
+                pred_bin = [
+                    derive_alarm_from_high_low(int(a), int(v), cfg)
+                    for a, v in zip(pa_hl, pv_hl)
+                ]
+            else:
+                pred_bin = [
+                    derive_binary_from_va(float(a), float(v), cfg.labels)
+                    for a, v in zip(pa, pv)
+                ]
 
         if len(true_bin) != n or len(pred_bin) != n:
             continue
@@ -87,7 +120,7 @@ def build_per_window_alarm_rows(fold_metrics: List[dict], cfg) -> List[dict]:
         for i in range(n):
             tb = int(true_bin[i])
             pb = int(pred_bin[i])
-            rows.append({
+            row = {
                 "participant": pid,
                 "window_index": i,
                 "seconds": (i + 1) * int(cfg.data.get("window_size_sec", 5)),
@@ -102,7 +135,10 @@ def build_per_window_alarm_rows(fold_metrics: List[dict], cfg) -> List[dict]:
                 "alarm_correct": tb == pb,
                 "outcome": alarm_outcome(tb, pb),
                 "outcome_label": OUTCOME_LABELS[alarm_outcome(tb, pb)],
-            })
+            }
+            if i < len(alarm_probs):
+                row["pred_alarm_prob"] = float(alarm_probs[i])
+            rows.append(row)
     return rows
 
 
@@ -121,7 +157,7 @@ def _per_participant_alarm_rows(fold_metrics: List[dict], cfg) -> List[dict]:
         if not pa:
             continue
 
-        true_lbls = fold.get("true_labels_3class")
+        true_lbls = _fold_true_alarm_labels(fold)
         if fold.get("true_binary") and fold.get("pred_binary"):
             true_b = [int(x) for x in fold["true_binary"]]
             pred_b = [int(x) for x in fold["pred_binary"]]

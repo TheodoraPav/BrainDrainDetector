@@ -25,21 +25,29 @@ from .splits import (
     build_train_val_window_split,
     pick_validation_participant,
 )
-from utils.labels import merge_to_binary
+from utils.labels import merge_to_binary, arousal_to_high_low, valence_to_high_low
 
 
 class BrainDrainDataset(Dataset):
 
-    def __init__(self, samples: List[dict], task_mode: str = "classification"):
+    def __init__(
+        self,
+        samples: List[dict],
+        task_mode: str = "classification",
+        labels_cfg=None,
+    ):
         """
         Args:
             samples:   list of dicts, each with keys waveform/audio_embedding,
                        biosignals, label, participant (and optionally arousal, valence)
-            task_mode: "classification" — returns Safe (0) / Alarm (1)
-                       "regression_va" — returns FloatTensor([arousal, valence])
+            task_mode: "classification" — Safe/Alarm
+                       "regression_va" — [arousal, valence]
+                       "classification_arousal" / "classification_valence" — High/Low (1/0)
+            labels_cfg: cfg.labels (required for classification_arousal/valence)
         """
-        self.samples   = samples
-        self.task_mode = task_mode
+        self.samples    = samples
+        self.task_mode  = task_mode
+        self.labels_cfg = labels_cfg
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -85,6 +93,22 @@ class BrainDrainDataset(Dataset):
                     "is missing valence. Re-run step 01 then step 04."
                 )
             target = torch.tensor(float(sample["valence"]), dtype=torch.float32)
+        elif self.task_mode == "classification_arousal":
+            if "arousal" not in sample:
+                raise KeyError(
+                    f"Sample {sample.get('participant', '?')} missing arousal — re-run step 01/04."
+                )
+            if self.labels_cfg is None:
+                raise ValueError("labels_cfg required for classification_arousal")
+            target = arousal_to_high_low(sample["arousal"], self.labels_cfg)
+        elif self.task_mode == "classification_valence":
+            if "valence" not in sample:
+                raise KeyError(
+                    f"Sample {sample.get('participant', '?')} missing valence — re-run step 01/04."
+                )
+            if self.labels_cfg is None:
+                raise ValueError("labels_cfg required for classification_valence")
+            target = valence_to_high_low(sample["valence"], self.labels_cfg)
         else:
             target = merge_to_binary(int(sample["label"]))
 

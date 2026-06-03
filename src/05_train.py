@@ -11,15 +11,15 @@ For each participant:
 Task modes (set via cfg.task.mode):
   "classification" — 2-class Safe/Alarm CE, early stopping on recall_alarm.
   "regression_va"           — joint A+V heads, early stopping on ccc_mean.
-  "regression_va_separated" — two independent models (arousal + valence), merged eval.
-  "regression_arousal"      — single arousal head (internal sub-run).
-  "regression_valence"      — single valence head (internal sub-run).
+  "va_separated_classify"   — two High/Low classifiers (arousal + valence), merged alarm.
+  "classification_arousal"  — sub-run (internal).
+  "classification_valence"  — sub-run (internal).
 
 Usage:
     python src/05_train.py --config configs/exp_baseline.yaml
     python src/05_train.py --config configs/exp_offline_aug.yaml
     python src/05_train.py --config configs/exp_va_baseline.yaml
-    python src/05_train.py --config configs/exp_va_separated.yaml
+    python src/05_train.py --config configs/exp_va_separated_classify.yaml
 """
 
 import argparse
@@ -55,12 +55,16 @@ from data.dataset import (
 from utils.metrics import (
     compute_va_metrics,
     compute_scalar_regression_metrics,
+    compute_va_high_low_metrics,
     compute_binary_alarm_metrics,
     average_metrics_across_folds,
 )
-from utils.labels import merge_to_binary
+from utils.labels import merge_to_binary, arousal_to_high_low, valence_to_high_low
 from utils.derived_eval import evaluate_derived_binary_from_va
-from utils.va_separated import merge_separated_fold_metrics, build_merged_summary
+from utils.va_separated_classify import (
+    merge_separated_classify_fold_metrics,
+    build_merged_classify_summary,
+)
 from utils.early_stopping import early_stopping_should_stop, update_validation_score
 from utils.pipeline_log import format_count_summary, log_participant_counts, log_stats, stage_ok, stage_start
 
@@ -69,6 +73,8 @@ from utils.pipeline_log import format_count_summary, log_participant_counts, log
 
 _SCALAR_REGRESSION_MODES = ("regression_arousal", "regression_valence")
 _REGRESSION_TASK_MODES = ("regression_va",) + _SCALAR_REGRESSION_MODES
+_VA_CLASSIFY_MODES = ("classification_arousal", "classification_valence")
+_VA_SEPARATED_MODE = "va_separated_classify"
 
 
 def _task_mode(cfg) -> str:
@@ -77,6 +83,14 @@ def _task_mode(cfg) -> str:
 
 def _is_classification_task(task_mode: str) -> bool:
     return task_mode == "classification"
+
+
+def _is_va_dimension_classification_task(task_mode: str) -> bool:
+    return task_mode in _VA_CLASSIFY_MODES
+
+
+def _is_any_classification_task(task_mode: str) -> bool:
+    return task_mode == "classification" or task_mode in _VA_CLASSIFY_MODES
 
 
 def _is_scalar_regression_task(task_mode: str) -> bool:
@@ -97,13 +111,13 @@ def _separated_checkpoint_dir(cfg, subtask: str) -> str:
 
 
 def _cfg_for_separated_subtask(cfg, subtask: str):
-    """Clone config for one separated sub-run (arousal or valence)."""
+    """Clone config for one separated High/Low sub-run (arousal or valence)."""
     cfg_sub = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
-    cfg_sub.task.mode = f"regression_{subtask}"
+    cfg_sub.task.mode = f"classification_{subtask}"
     cfg_sub.paths.checkpoints = _separated_checkpoint_dir(cfg, subtask)
     sep = cfg.task.get("separated", {})
     cfg_sub.training.selection_metric = sep.get(
-        f"selection_metric_{subtask}", f"ccc_{subtask}",
+        f"selection_metric_{subtask}", f"f1_{subtask}_high",
     )
     return cfg_sub
 
@@ -117,7 +131,7 @@ def _build_model_cfg(cfg) -> dict:
     model_cfg = dict(cfg.model)
     task_mode = _task_mode(cfg)
     model_cfg["task_mode"] = task_mode
-    if task_mode == "classification":
+    if task_mode in ("classification",) + _VA_CLASSIFY_MODES:
         model_cfg["num_classes"] = 2
     return model_cfg
 
@@ -332,14 +346,32 @@ def precompute_audio_embeddings(
     if total == 0:
         return
 
+    pending = [s for s in samples if "audio_embedding" not in s]
+    already_cached = total - len(pending)
+    if already_cached:
+        print(
+            f"Reusing cached audio embeddings for {already_cached}/{total} windows "
+            f"(e.g. second separated VA sub-run)."
+        )
+    if not pending:
+        print(f"Audio embedding cache ready ({total}/{total} windows).")
+        return
+
     print(
-        f"Precomputing audio embeddings for {total} windows "
+        f"Precomputing audio embeddings for {len(pending)}/{total} windows "
         f"(batch_size={batch_size}, drop_waveforms={drop_waveforms})..."
     )
 
-    for start in range(0, total, batch_size):
-        batch = samples[start : start + batch_size]
-        waveforms  = torch.stack([s["waveform"] for s in batch]).to(device)
+    for start in range(0, len(pending), batch_size):
+        batch = pending[start : start + batch_size]
+        missing_wf = [s for s in batch if "waveform" not in s]
+        if missing_wf:
+            raise RuntimeError(
+                f"{len(missing_wf)} window(s) lack waveform and audio_embedding. "
+                "Re-run step 04 or disable drop_waveform_after_embedding_cache "
+                "before the first sub-run completes."
+            )
+        waveforms = torch.stack([s["waveform"] for s in batch]).to(device)
         embeddings = audio_encoder(waveforms).cpu()
         for sample, emb in zip(batch, embeddings):
             sample["audio_embedding"] = emb
@@ -446,6 +478,10 @@ def _compute_epoch_score(all_labels, all_preds, task_mode: str, selection_metric
         dim = "arousal" if task_mode == "regression_arousal" else "valence"
         m = compute_scalar_regression_metrics(all_labels, all_preds, dim)
         score = m.get(selection_metric, m[f"ccc_{dim}"])
+    elif _is_va_dimension_classification_task(task_mode):
+        dim = "arousal" if task_mode == "classification_arousal" else "valence"
+        m = compute_va_high_low_metrics(all_labels, all_preds, dim)
+        score = m.get(selection_metric, m.get(f"f1_{dim}_high", 0.0))
     else:
         m = compute_binary_alarm_metrics(all_labels, all_preds)
         score = m.get(selection_metric, m["recall_alarm"])
@@ -494,9 +530,10 @@ def train_one_fold(
             f"(fit={len(fit_samples)}, val={len(val_samples)}, mode={val_split_mode})"
         )
 
-    train_dataset = BrainDrainDataset(fit_samples,  task_mode=task_mode)
-    val_dataset   = BrainDrainDataset(val_samples,  task_mode=task_mode)
-    test_dataset  = BrainDrainDataset(test_samples, task_mode=task_mode)
+    labels_cfg = cfg.labels
+    train_dataset = BrainDrainDataset(fit_samples,  task_mode=task_mode, labels_cfg=labels_cfg)
+    val_dataset   = BrainDrainDataset(val_samples,  task_mode=task_mode, labels_cfg=labels_cfg)
+    test_dataset  = BrainDrainDataset(test_samples, task_mode=task_mode, labels_cfg=labels_cfg)
 
     val_loader  = DataLoader(val_dataset,  batch_size=cfg.training.batch_size, shuffle=False, num_workers=0)
     test_loader = DataLoader(test_dataset, batch_size=cfg.training.batch_size, shuffle=False, num_workers=0)
@@ -558,13 +595,20 @@ def train_one_fold(
                 )
 
     class_weights = None
-    if _is_classification_task(task_mode) and cfg.training.get("weighted_loss", True):
+    if _is_any_classification_task(task_mode) and cfg.training.get("weighted_loss", True):
         class_counts = {0: 0, 1: 0}
         for s in fit_samples:
-            lbl = merge_to_binary(int(s["label"]))
+            if task_mode == "classification_arousal":
+                lbl = arousal_to_high_low(s["arousal"], labels_cfg)
+                class_names = {0: "Arousal Low", 1: "Arousal High"}
+            elif task_mode == "classification_valence":
+                lbl = valence_to_high_low(s["valence"], labels_cfg)
+                class_names = {0: "Valence Low", 1: "Valence High"}
+            else:
+                lbl = merge_to_binary(int(s["label"]))
+                class_names = {0: "Safe", 1: "Alarm"}
             class_counts[lbl] = class_counts.get(lbl, 0) + 1
         num_classes = 2
-        class_names = {0: "Safe", 1: "Alarm"}
 
         total = len(fit_samples)
         weights = []
@@ -743,7 +787,24 @@ def _build_fold_metrics(final_labels, final_preds, final_probs, participant, tas
             base["pred_valence"] = pred_vals
         gt_labels = [int(s["label"]) for s in _get_test_samples_for_labels(participant, cfg)]
         if gt_labels:
-            base["true_labels_3class"] = gt_labels
+            base["true_alarm_labels"] = gt_labels
+    elif _is_va_dimension_classification_task(task_mode):
+        dim = "arousal" if task_mode == "classification_arousal" else "valence"
+        true_hl = [int(x) for x in final_labels]
+        pred_hl = [int(x) for x in final_preds]
+        base.update(compute_va_high_low_metrics(true_hl, pred_hl, dim))
+        hl_key = f"{dim}_hl"
+        base[f"true_{hl_key}"] = true_hl
+        base[f"pred_{hl_key}"] = pred_hl
+        base["pred_probs"] = final_probs
+        test_samples = _get_test_samples_for_labels(participant, cfg)
+        if test_samples:
+            if dim == "arousal":
+                base["true_arousal"] = [float(s["arousal"]) for s in test_samples]
+            else:
+                base["true_valence"] = [float(s["valence"]) for s in test_samples]
+            base["true_labels_3class"] = [int(s["label"]) for s in test_samples]
+            base["true_alarm_labels"] = base["true_labels_3class"]
     else:
         binary_m = compute_binary_alarm_metrics(final_labels, final_preds)
         base.update(binary_m)
@@ -782,6 +843,8 @@ def _fold_metrics_have_predictions(fold_metrics: list) -> bool:
         ("true_labels" in first and "pred_labels" in first)
         or ("true_arousal" in first and "pred_arousal" in first)
         or ("true_valence" in first and "pred_valence" in first)
+        or ("true_arousal_hl" in first and "pred_arousal_hl" in first)
+        or ("true_valence_hl" in first and "pred_valence_hl" in first)
     )
 
 
@@ -792,8 +855,8 @@ def _save_loso_results(
     extra_meta: dict | None = None,
 ) -> Path:
     task_mode = _task_mode(cfg)
-    if task_mode == "regression_va_separated":
-        summary = build_merged_summary(all_fold_metrics)
+    if task_mode == "va_separated_classify":
+        summary = build_merged_classify_summary(all_fold_metrics)
     else:
         summary = average_metrics_across_folds(all_fold_metrics)
 
@@ -851,7 +914,7 @@ def _evaluate_fold_checkpoint(
     task_mode = _task_mode(cfg)
     criterion = _build_criterion(cfg)
     test_loader = DataLoader(
-        BrainDrainDataset(test_samples, task_mode=task_mode),
+        BrainDrainDataset(test_samples, task_mode=task_mode, labels_cfg=cfg.labels),
         batch_size=cfg.training.batch_size,
         shuffle=False,
         num_workers=0,
@@ -910,7 +973,7 @@ def _configure_cuda_backend() -> None:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def _validate_regression_samples(samples: list, task_mode: str) -> None:
-    if task_mode in ("regression_va", "regression_va_separated"):
+    if task_mode in ("regression_va", _VA_SEPARATED_MODE):
         missing = [s for s in samples if "arousal" not in s or "valence" not in s]
         if missing:
             raise RuntimeError(
@@ -1010,8 +1073,8 @@ def _run_loso_training(
     return all_fold_metrics
 
 
-def _main_regression_va_separated(cfg) -> None:
-    """Two independent LOSO runs (arousal + valence), then merge for alarm metrics."""
+def _main_va_separated_classify(cfg) -> None:
+    """Two independent High/Low LOSO runs, then merge for overload/alarm metrics."""
     global _SAMPLES_CACHE
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1019,12 +1082,12 @@ def _main_regression_va_separated(cfg) -> None:
     samples = load_all_samples(str(Path(cfg.paths.data_processed) / windows_dir))
     _SAMPLES_CACHE = samples
     participant_ids = get_all_participant_ids(samples)
-    _validate_regression_samples(samples, "regression_va_separated")
+    _validate_regression_samples(samples, _VA_SEPARATED_MODE)
 
     merged_path = Path(cfg.paths.data_processed) / "loso_results.pt"
     if merged_path.is_file():
         data = torch.load(merged_path, weights_only=False)
-        if data.get("task_mode") == "regression_va_separated" and _fold_metrics_have_predictions(
+        if data.get("task_mode") == _VA_SEPARATED_MODE and _fold_metrics_have_predictions(
             data.get("fold_metrics", []),
         ):
             print(f"Merged separated results already exist: {merged_path}")
@@ -1034,7 +1097,7 @@ def _main_regression_va_separated(cfg) -> None:
             return
 
     print("\n" + "=" * 60)
-    print("Separated VA — sub-run 1/2: arousal-only model")
+    print("Separated VA — sub-run 1/2: arousal High/Low (1–3 vs 4–5)")
     print("=" * 60)
     cfg_a = _cfg_for_separated_subtask(cfg, "arousal")
     arousal_folds = _run_loso_training(
@@ -1043,7 +1106,7 @@ def _main_regression_va_separated(cfg) -> None:
     )
 
     print("\n" + "=" * 60)
-    print("Separated VA — sub-run 2/2: valence-only model")
+    print("Separated VA — sub-run 2/2: valence High/Low (1–3 vs 4–5)")
     print("=" * 60)
     cfg_v = _cfg_for_separated_subtask(cfg, "valence")
     valence_folds = _run_loso_training(
@@ -1052,16 +1115,15 @@ def _main_regression_va_separated(cfg) -> None:
     )
 
     print("\n" + "=" * 60)
-    print("Aligning arousal + valence preds for COMBINATION eval (alarm / overload)")
-    print("  Per-dimension metrics: see loso_results_arousal.pt / loso_results_valence.pt")
+    print("Aligning High/Low preds → combination overload / alarm eval")
     print("=" * 60)
-    merged_folds = merge_separated_fold_metrics(arousal_folds, valence_folds, cfg)
+    merged_folds = merge_separated_classify_fold_metrics(arousal_folds, valence_folds, cfg)
     _save_loso_results(
         cfg,
         merged_folds,
         results_filename="loso_results.pt",
         extra_meta={
-            "task_mode": "regression_va_separated",
+            "task_mode": _VA_SEPARATED_MODE,
             "sub_results": {
                 "arousal": "loso_results_arousal.pt",
                 "valence": "loso_results_valence.pt",
@@ -1083,13 +1145,13 @@ def main(cfg):
     task_mode = _task_mode(cfg)
     print(f"Task mode: {task_mode}")
 
-    if task_mode == "regression_va_separated":
+    if task_mode == _VA_SEPARATED_MODE:
         log_stats("05", {
             "device": str(device),
             "task_mode": task_mode,
             "weighted_loss": cfg.training.get("weighted_loss", False),
         })
-        _main_regression_va_separated(cfg)
+        _main_va_separated_classify(cfg)
         return
 
     windows_dir = "windows_aug" if cfg.augmentation.enabled else "windows"

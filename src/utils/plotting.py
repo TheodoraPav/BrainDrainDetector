@@ -137,8 +137,10 @@ def plot_roc_curve(
     predicted_alarm_probs: List[float],
     figures_dir: str,
     filename: str = "roc_curve.png",
+    title: str = "ROC Curve — Safe vs Alarm",
+    positive_label: str = "Alarm",
 ) -> str:
-    """ROC curve for binary Safe vs Alarm classification."""
+    """ROC curve for binary classification (positive class = score in predicted_alarm_probs)."""
     true_arr = np.array(true_binary)
     pred_arr = np.array(predicted_alarm_probs)
 
@@ -146,11 +148,11 @@ def plot_roc_curve(
     roc_auc = auc(fpr, tpr)
 
     fig, ax = plt.subplots(figsize=(6, 5))
-    ax.plot(fpr, tpr, color="#e63946", linewidth=2, label=f"Alarm (AUC = {roc_auc:.4f})")
+    ax.plot(fpr, tpr, color="#e63946", linewidth=2, label=f"{positive_label} (AUC = {roc_auc:.4f})")
     ax.plot([0, 1], [0, 1], "k--", linewidth=0.8)
     ax.set_xlabel("False Positive Rate")
     ax.set_ylabel("True Positive Rate")
-    ax.set_title("ROC Curve — Safe vs Alarm")
+    ax.set_title(title)
     ax.legend(loc="lower right")
     ax.grid(True, linestyle=":", alpha=0.6)
     plt.tight_layout()

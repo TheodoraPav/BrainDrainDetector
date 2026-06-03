@@ -24,8 +24,8 @@ def evaluate_derived_binary_from_va(
     Args:
         pred_arousal: predicted arousal values (one per window)
         pred_valence: predicted valence values (one per window)
-        true_labels:  GT binary labels (0=Safe, 1=Alarm); legacy 3-class values
-                      are merged via merge_to_binary
+        true_labels:  GT Safe/Alarm (0/1); legacy tensors with VA-zone codes
+                      0/1/2 are normalized via merge_to_binary
         cfg:          full OmegaConf config (labels section used for va_only rules)
 
     Returns:

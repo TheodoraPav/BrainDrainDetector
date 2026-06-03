@@ -88,6 +88,27 @@ def _compute_pcc(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return float(np.corrcoef(y_true, y_pred)[0, 1])
 
 
+def compute_va_high_low_metrics(
+    true_labels: List[int],
+    pred_labels: List[int],
+    dimension: str,
+) -> Dict[str, float]:
+    """
+    Classification metrics for arousal or valence High/Low (1=High, 0=Low).
+    """
+    if dimension not in ("arousal", "valence"):
+        raise ValueError(f"dimension must be 'arousal' or 'valence', got {dimension!r}")
+    base = compute_binary_alarm_metrics(true_labels, pred_labels)
+    return {
+        f"accuracy_{dimension}_hl": base["accuracy_alarm"],
+        f"balanced_accuracy_{dimension}_hl": base["balanced_accuracy_alarm"],
+        f"f1_{dimension}_high": base["f1_alarm"],
+        f"recall_{dimension}_high": base["recall_alarm"],
+        f"precision_{dimension}_high": base["precision_alarm"],
+        f"specificity_{dimension}_low": base["specificity_safe"],
+    }
+
+
 def compute_scalar_regression_metrics(
     true_vals: List[float],
     pred_vals: List[float],

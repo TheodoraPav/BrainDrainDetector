@@ -14,7 +14,7 @@ paths:
 task:
   # "classification"            — 2-class CE (Safe=0, Alarm=1)  [default]
   # "regression_va"             — joint A+V heads on shared fusion
-  # "regression_va_separated"   — two independent models, merged eval + alarm
+  # "va_separated_classify"     — two High/Low classifiers (A / V), merged alarm
   mode: "classification"
 
   # Store raw arousal + valence in each window tensor during step 04.
@@ -52,6 +52,10 @@ labels:
   # Optimal (→ Safe via merge): high valence AND low arousal
   optimal_min_valence: 4
   optimal_max_arousal: 2
+  # High/Low targets for va_separated_classify (1=High 4–5, 0=Low 1–3)
+  va_high_low:
+    low_values: [1, 2, 3]
+    high_values: [4, 5]
 
 # ============================================================
 # Model

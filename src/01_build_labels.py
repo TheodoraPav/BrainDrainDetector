@@ -1,8 +1,8 @@
 """
 Step 1 — Build labels from self-annotation CSVs.
 
-Reads every P{N}.self.csv and builds binary labels from arousal + valence only
-(no emotion flags). Internal 3-class rule, then Safe/Alarm merge.
+Reads every P{N}.self.csv and writes binary Safe/Alarm labels from arousal +
+valence only (no emotion flags). Logs an optional VA-zone breakdown.
 
 Outputs:
   data_processed/labels.csv
@@ -64,7 +64,7 @@ def main(cfg):
     full_df = pd.concat(all_labels, ignore_index=True)
 
     counts_3class = full_df["label_3class"].value_counts().sort_index()
-    print("\nInternal 3-class breakdown (before binary merge):")
+    print("\nVA-zone breakdown (informational; training uses binary Safe/Alarm):")
     label_names = {0: "Optimal", 1: "Overloaded", 2: "Grey Zone"}
     for label, count in counts_3class.items():
         print(f"  Class {label} ({label_names[label]}): {count} windows ({count / len(full_df):.1%})")

@@ -2,7 +2,7 @@
 
 Multimodal detection of cognitive overload and socioemotional stress using the K EmoCon dataset.
 
-The system fuses audio, E4 wristband physiological signals, and NeuroSky EEG data to predict three states: Overloaded, Optimal, and Grey Zone.
+The system fuses audio, E4 wristband physiological signals, and NeuroSky EEG data to predict a binary alarm state: **Safe** (0) or **Alarm** (1).
 
 ---
 
@@ -15,7 +15,7 @@ BrainDrainDetector/
 │   ├── models/                 # Neural network components
 │   ├── data/                   # Dataset and augmentation
 │   ├── utils/                  # Metrics, plotting, quality parsing
-│   ├── 01_build_labels.py      # Build 3-class labels from annotations
+│   ├── 01_build_labels.py      # Build Safe/Alarm labels from self-annotations
 │   ├── 02_preprocess_audio.py  # Diarization, VAD, 5s window extraction
 │   ├── 03_preprocess_physio.py # E4 and NeuroSky windowing and quality check
 │   ├── 04_build_tensors.py     # Save ready-to-use PyTorch tensors
@@ -32,13 +32,14 @@ BrainDrainDetector/
 
 ## Labels
 
-| Class | Name | Condition |
-|-------|------|-----------|
-| 0 | Optimal | Concentration == x AND Valence >= 3 AND no negative emotions |
-| 1 | Overloaded | Valence <= 3 AND (Frustration/Confusion/Nervous == x OR Arousal >= 4) |
-| 2 | Grey Zone | All other intermediate states |
+Ground truth comes from **self-annotations only** (`P{N}.self.csv`). Emotion checkboxes in the CSV are ignored; each 5-second window uses **arousal** and **valence** (1–5) to assign a binary label:
 
-At inference time, classes 0 and 2 merge into a safe state. Class 1 triggers an alert.
+| Label | Name | Rule (from arousal *A*, valence *V*) |
+|-------|------|--------------------------------------|
+| 0 | Safe | Not overloaded: either *V* > 3 or *A* < 4 (includes “optimal” and “grey zone” VA states) |
+| 1 | Alarm | Overloaded: *V* ≤ 3 **and** *A* ≥ 4 |
+
+Thresholds are in `configs/base.yaml` (`labels.overloaded_*`, `labels.optimal_*`). Step 01 may print an internal VA-zone breakdown (optimal / overloaded / grey) for logging; **training and evaluation use only Safe vs Alarm** (`model.num_classes: 2`).
 
 ---
 

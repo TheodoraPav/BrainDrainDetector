@@ -62,7 +62,9 @@ def _detect_task_mode(fold_metrics: list, stored_mode: str | None = None) -> str
     if not fold_metrics:
         return "classification"
     first = fold_metrics[0]
-    if "ccc_arousal" in first or "mae_arousal" in first:
+    if "pred_arousal_hl" in first and "pred_valence_hl" in first:
+        return "va_separated_classify"
+    if "ccc_arousal" in first or "mae_arousal" in first or "f1_arousal_high" in first:
         if "pred_valence" in first and "pred_arousal" in first:
             return "regression_va"
         if "pred_arousal" in first and "pred_valence" not in first:
@@ -74,7 +76,11 @@ def _detect_task_mode(fold_metrics: list, stored_mode: str | None = None) -> str
 
 
 def _is_va_evaluation_mode(task_mode: str) -> bool:
-    return task_mode in ("regression_va", "regression_va_separated")
+    return task_mode == "regression_va"
+
+
+def _is_separated_classify_mode(task_mode: str) -> bool:
+    return task_mode == "va_separated_classify"
 
 
 def load_experiment_summary(results_path: Path):
@@ -90,6 +96,38 @@ def _collect_flat(fold_metrics: list, key: str) -> list:
         if key in fold:
             result.extend(fold[key])
     return result
+
+
+def _collect_high_class_probs(fold_metrics: list, key: str = "pred_probs") -> list[float]:
+    """Flattens per-window softmax rows to P(class=1 High)."""
+    scores: list[float] = []
+    for fold in fold_metrics:
+        if key not in fold:
+            continue
+        for row in fold[key]:
+            if isinstance(row, (list, tuple)) and len(row) >= 2:
+                scores.append(float(row[1]))
+            else:
+                scores.append(float(row))
+    return scores
+
+
+def _collect_alarm_probs(fold_metrics: list) -> list[float]:
+    """Alarm scores for ROC: pred_alarm_probs or second column of pred_probs."""
+    flat = _collect_flat(fold_metrics, "pred_alarm_probs")
+    if flat:
+        return [float(x) for x in flat]
+
+    scores: list[float] = []
+    for fold in fold_metrics:
+        if "pred_probs" not in fold:
+            continue
+        for row in fold["pred_probs"]:
+            if isinstance(row, (list, tuple)) and len(row) >= 2:
+                scores.append(float(row[1]))
+            else:
+                scores.append(float(row))
+    return scores
 
 
 def _report_va_regression(summary: dict, fold_metrics: list, figures_dir: str, data_processed_dir: str) -> None:
@@ -149,6 +187,129 @@ def _report_va_regression(summary: dict, fold_metrics: list, figures_dir: str, d
     print(f"\nVA figures ({len(saved)} files) in: {va_fig_dir}")
     for p in saved:
         print(f"  {p}")
+
+
+def _report_dimension_high_low(
+    summary: dict,
+    fold_metrics: list,
+    dimension: str,
+    figures_dir: str,
+    data_processed_dir: str,
+) -> None:
+    """Classification report for arousal or valence High/Low sub-run."""
+    dim_cap = dimension.capitalize()
+    hl_key = f"{dimension}_hl"
+    fig_dir = Path(figures_dir) / f"hl_{dimension}"
+    fig_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"\n=== {dim_cap} High/Low classifier (LOSO) ===")
+    metric_keys = [
+        (f"accuracy_{dimension}_hl", "Accuracy"),
+        (f"f1_{dimension}_high", "F1 High"),
+        (f"recall_{dimension}_high", "Recall High"),
+        (f"precision_{dimension}_high", "Precision High"),
+        (f"specificity_{dimension}_low", "Specificity Low"),
+    ]
+    for key, label in metric_keys:
+        mean_key = f"{key}_mean"
+        if mean_key in summary:
+            print(f"  {label}: {summary[mean_key]:.4f} ± {summary.get(key + '_std', 0):.4f}")
+
+    true_hl = _collect_flat(fold_metrics, f"true_{hl_key}")
+    pred_hl = _collect_flat(fold_metrics, f"pred_{hl_key}")
+    if not true_hl:
+        true_hl = _collect_flat(fold_metrics, "true_labels")
+    if not pred_hl:
+        pred_hl = _collect_flat(fold_metrics, "pred_labels")
+
+    high_probs = _collect_high_class_probs(fold_metrics, "pred_probs")
+
+    if true_hl and pred_hl:
+        print_classification_report(true_hl, pred_hl)
+        cm_path = plot_confusion_matrix(
+            true_hl, pred_hl, str(fig_dir),
+            filename=f"confusion_matrix_{dimension}_high_low.png",
+        )
+        print(f"  Confusion matrix: {cm_path}")
+
+    if true_hl and high_probs and len(true_hl) == len(high_probs):
+        roc_path = plot_roc_curve(
+            true_hl,
+            high_probs,
+            str(fig_dir),
+            filename=f"roc_curve_{dimension}_high_low.png",
+            title=f"ROC — {dim_cap} High vs Low (High = 4–5)",
+            positive_label="High",
+        )
+        print(f"  ROC curve: {roc_path}")
+    elif true_hl and not high_probs:
+        print(f"  ROC skipped: no pred_probs in {dimension} loso_results (re-run step 05)")
+
+    report_path = Path(data_processed_dir) / f"hl_evaluation_report_{dimension}.json"
+    import json
+    report = {
+        "dimension": dimension,
+        "target": "1=High, 0=Low",
+        "loso_summary": {k: v for k, v in summary.items() if dimension in k},
+        "n_windows": len(true_hl),
+    }
+    with report_path.open("w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2)
+    print(f"  Report saved: {report_path}")
+
+
+def _report_separated_classify_evaluation(
+    cfg,
+    figures_dir: str,
+    data_processed_dir: str,
+) -> None:
+    """Three blocks: arousal HL, valence HL, combination alarm."""
+    data_proc = Path(data_processed_dir)
+    arousal_path = data_proc / "loso_results_arousal.pt"
+    valence_path = data_proc / "loso_results_valence.pt"
+    merged_path = data_proc / "loso_results.pt"
+
+    print("\n" + "=" * 60)
+    print("SEPARATED CLASSIFY — (1/3) Arousal High/Low")
+    print("=" * 60)
+    if arousal_path.is_file():
+        a_summary, a_folds, _ = load_experiment_summary(arousal_path)
+        _report_dimension_high_low(
+            a_summary, a_folds, "arousal", figures_dir, data_processed_dir,
+        )
+    else:
+        print(f"  Missing: {arousal_path}")
+
+    print("\n" + "=" * 60)
+    print("SEPARATED CLASSIFY — (2/3) Valence High/Low")
+    print("=" * 60)
+    if valence_path.is_file():
+        v_summary, v_folds, _ = load_experiment_summary(valence_path)
+        _report_dimension_high_low(
+            v_summary, v_folds, "valence", figures_dir, data_processed_dir,
+        )
+    else:
+        print(f"  Missing: {valence_path}")
+
+    print("\n" + "=" * 60)
+    print("SEPARATED CLASSIFY — (3/3) Combination overload / alarm")
+    print("  From predicted High/Low arousal + valence (VA proxy rules).")
+    print("=" * 60)
+    if not merged_path.is_file():
+        print(f"  Missing: {merged_path}")
+        return
+
+    c_summary, c_folds, _ = load_experiment_summary(merged_path)
+    _report_derived_alarm_from_va(
+        c_summary, c_folds, cfg, figures_dir, data_processed_dir,
+    )
+    _report_binary_classification(
+        c_summary, c_folds, figures_dir,
+        title="Combination: derived alarm (arousal HL + valence HL)",
+        cm_filename="confusion_matrix_combination_alarm.png",
+        roc_filename="roc_curve_combination_alarm.png",
+    )
+    plot_sample_participant_timelines(c_folds, figures_dir)
 
 
 def _report_va_single_dimension(
@@ -315,16 +476,20 @@ def _report_binary_classification(
         cm_path = plot_confusion_matrix(all_true, all_pred, figures_dir, filename=cm_filename)
         print(f"Confusion matrix saved: {cm_path}")
 
-    pred_probs = _collect_flat(fold_metrics, "pred_probs")
-    if all_true and pred_probs:
+    alarm_probs = _collect_alarm_probs(fold_metrics)
+    if all_true and alarm_probs and len(all_true) == len(alarm_probs):
         try:
-            pred_probs_arr = np.array(pred_probs)
-            if len(pred_probs_arr.shape) == 2 and pred_probs_arr.shape[1] >= 2:
-                alarm_probs = pred_probs_arr[:, 1].tolist()
-                roc_path = plot_roc_curve(all_true, alarm_probs, figures_dir, filename=roc_filename)
-                print(f"ROC curve saved: {roc_path}")
+            roc_path = plot_roc_curve(
+                all_true,
+                alarm_probs,
+                figures_dir,
+                filename=roc_filename,
+            )
+            print(f"ROC curve saved: {roc_path}")
         except Exception as e:
             print(f"  Warning: could not plot ROC curve: {e}")
+    elif all_true and not alarm_probs:
+        print("  ROC skipped: no pred_alarm_probs / pred_probs in fold metrics (re-run step 05+06)")
 
     summary_path = plot_loso_summary_bars(summary, figures_dir)
     if summary_path:
@@ -425,9 +590,6 @@ def main(cfg, compare_all: bool = False):
 
     task_mode = _detect_task_mode(fold_metrics, stored_mode)
     print(f"Task mode detected: {task_mode}")
-    if task_mode == "regression_va_separated":
-        print("  (merged arousal + valence models — per-dimension VA + derived alarm)")
-
     log_stats("06", {
         "results_file":  str(results_path),
         "task_mode":     task_mode,
@@ -437,8 +599,8 @@ def main(cfg, compare_all: bool = False):
 
     Path(figures_dir).mkdir(parents=True, exist_ok=True)
 
-    if task_mode == "regression_va_separated":
-        _report_separated_va_evaluation(cfg, figures_dir, cfg.paths.data_processed)
+    if task_mode == "va_separated_classify":
+        _report_separated_classify_evaluation(cfg, figures_dir, cfg.paths.data_processed)
     elif _is_va_evaluation_mode(task_mode):
         _report_va_regression(summary, fold_metrics, figures_dir, cfg.paths.data_processed)
         _report_derived_alarm_from_va(
