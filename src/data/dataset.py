@@ -115,6 +115,130 @@ class BrainDrainDataset(Dataset):
         return audio_input, biosignals, target
 
 
+def _sample_audio_tensor(sample: dict) -> torch.Tensor:
+    if "audio_embedding" in sample:
+        return sample["audio_embedding"]
+    if "waveform" in sample:
+        return sample["waveform"]
+    raise KeyError(
+        f"Sample {sample.get('participant', '?')} sec={sample.get('seconds', '?')} "
+        "has neither audio_embedding nor waveform."
+    )
+
+
+def _resolve_target(sample: dict, task_mode: str, labels_cfg) -> Union[int, torch.Tensor]:
+    if task_mode == "regression_va":
+        if "arousal" not in sample or "valence" not in sample:
+            raise KeyError(
+                f"Sample {sample.get('participant', '?')} sec={sample.get('seconds', '?')} "
+                "is missing arousal/valence fields."
+            )
+        return torch.tensor(
+            [float(sample["arousal"]), float(sample["valence"])],
+            dtype=torch.float32,
+        )
+    if task_mode == "regression_arousal":
+        if "arousal" not in sample:
+            raise KeyError(f"Sample {sample.get('participant', '?')} missing arousal.")
+        return torch.tensor(float(sample["arousal"]), dtype=torch.float32)
+    if task_mode == "regression_valence":
+        if "valence" not in sample:
+            raise KeyError(f"Sample {sample.get('participant', '?')} missing valence.")
+        return torch.tensor(float(sample["valence"]), dtype=torch.float32)
+    if task_mode == "classification_arousal":
+        if labels_cfg is None:
+            raise ValueError("labels_cfg required for classification_arousal")
+        return arousal_to_high_low(sample["arousal"], labels_cfg)
+    if task_mode == "classification_valence":
+        if labels_cfg is None:
+            raise ValueError("labels_cfg required for classification_valence")
+        return valence_to_high_low(sample["valence"], labels_cfg)
+    return merge_to_binary(int(sample["label"]))
+
+
+class WindowSequenceDataset(Dataset):
+    """
+    One training item = num_windows consecutive 5 s windows for the same participant.
+
+    The label is taken from the last window in the sequence (causal prediction).
+    Left padding repeats the earliest available window when fewer than num_windows exist.
+    """
+
+    def __init__(
+        self,
+        samples: List[dict],
+        task_mode: str = "classification",
+        labels_cfg=None,
+        num_windows: int = 5,
+    ):
+        if num_windows < 1:
+            raise ValueError(f"num_windows must be >= 1, got {num_windows}")
+        self.samples = samples
+        self.task_mode = task_mode
+        self.labels_cfg = labels_cfg
+        self.num_windows = num_windows
+
+        by_participant: Dict[str, List[Tuple[float, int]]] = defaultdict(list)
+        for idx, sample in enumerate(samples):
+            by_participant[sample["participant"]].append(
+                (float(sample.get("seconds", idx)), idx),
+            )
+
+        self._entries: List[int] = []
+        self._sorted_by_participant: Dict[str, List[int]] = {}
+        for participant in sorted(by_participant.keys()):
+            ordered = sorted(by_participant[participant], key=lambda x: x[0])
+            sorted_indices = [idx for _, idx in ordered]
+            self._sorted_by_participant[participant] = sorted_indices
+            self._entries.extend(sorted_indices)
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def _context_indices(self, sorted_indices: List[int], end_idx: int) -> List[int]:
+        local_pos = sorted_indices.index(end_idx)
+        start = max(0, local_pos - self.num_windows + 1)
+        ctx = list(sorted_indices[start : local_pos + 1])
+        while len(ctx) < self.num_windows:
+            ctx.insert(0, sorted_indices[0])
+        return ctx[-self.num_windows :]
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, Union[int, torch.Tensor]]:
+        end_idx = self._entries[idx]
+        participant = self.samples[end_idx]["participant"]
+        ctx_indices = self._context_indices(
+            self._sorted_by_participant[participant],
+            end_idx,
+        )
+
+        audio_seq = torch.stack([_sample_audio_tensor(self.samples[i]) for i in ctx_indices])
+        bio_seq = torch.stack([self.samples[i]["biosignals"] for i in ctx_indices])
+        target = _resolve_target(self.samples[end_idx], self.task_mode, self.labels_cfg)
+        return audio_seq, bio_seq, target
+
+
+def make_brain_drain_dataset(
+    samples: List[dict],
+    task_mode: str,
+    labels_cfg=None,
+    temporal_cfg: dict | None = None,
+) -> Dataset:
+    """
+    Returns BrainDrainDataset (single window) or WindowSequenceDataset when temporal is on.
+    """
+    temporal_cfg = temporal_cfg or {}
+    if temporal_cfg.get("enabled", False) and str(temporal_cfg.get("type", "none")).lower() not in (
+        "none", "off", "",
+    ):
+        return WindowSequenceDataset(
+            samples,
+            task_mode=task_mode,
+            labels_cfg=labels_cfg,
+            num_windows=int(temporal_cfg.get("num_windows", 5)),
+        )
+    return BrainDrainDataset(samples, task_mode=task_mode, labels_cfg=labels_cfg)
+
+
 def load_all_samples(data_processed_dir: str) -> List[dict]:
     """
     Loads all pre-built .pt sample files from data_processed/.

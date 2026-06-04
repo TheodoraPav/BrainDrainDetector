@@ -40,7 +40,7 @@ from models.audio_encoder import AudioEncoder, load_wav2vec2_backbone
 from models.classifier import BrainDrainDetector
 
 from data.dataset import (
-    BrainDrainDataset,
+    make_brain_drain_dataset,
     build_balanced_epoch_indices,
     build_loso_splits,
     build_train_val_splits,
@@ -124,6 +124,41 @@ def _cfg_for_separated_subtask(cfg, subtask: str):
 
 def _selection_metric(cfg) -> str:
     return cfg.training.get("selection_metric", "recall_alarm")
+
+
+def _temporal_cfg(cfg) -> dict:
+    return dict(cfg.model.get("temporal", {}) or {})
+
+
+def _temporal_enabled(cfg) -> bool:
+    t = _temporal_cfg(cfg)
+    if not t.get("enabled", False):
+        return False
+    return str(t.get("type", "none")).lower() not in ("none", "off", "")
+
+
+def _temporal_signature(cfg) -> dict:
+    """Stable metadata stored in loso_results.pt to detect stale skip-if-exists runs."""
+    t = _temporal_cfg(cfg)
+    enabled = _temporal_enabled(cfg)
+    return {
+        "enabled": enabled,
+        "type": str(t.get("type", "none")).lower() if enabled else "none",
+        "num_windows": int(t.get("num_windows", 5)) if enabled else 1,
+        "hidden_size": int(t.get("hidden_size", 128)) if enabled else 0,
+        "bidirectional": bool(t.get("bidirectional", False)) if enabled else False,
+    }
+
+
+def _loso_meta_matches_cfg(cfg, data: dict) -> bool:
+    """False when cached LOSO results were produced with a different temporal setup."""
+    if data.get("task_mode") != _task_mode(cfg):
+        return False
+    saved = data.get("temporal_signature")
+    current = _temporal_signature(cfg)
+    if saved is None:
+        return not current["enabled"]
+    return saved == current
 
 
 def _build_model_cfg(cfg) -> dict:
@@ -531,9 +566,22 @@ def train_one_fold(
         )
 
     labels_cfg = cfg.labels
-    train_dataset = BrainDrainDataset(fit_samples,  task_mode=task_mode, labels_cfg=labels_cfg)
-    val_dataset   = BrainDrainDataset(val_samples,  task_mode=task_mode, labels_cfg=labels_cfg)
-    test_dataset  = BrainDrainDataset(test_samples, task_mode=task_mode, labels_cfg=labels_cfg)
+    temporal_cfg = _temporal_cfg(cfg)
+    train_dataset = make_brain_drain_dataset(
+        fit_samples, task_mode=task_mode, labels_cfg=labels_cfg, temporal_cfg=temporal_cfg,
+    )
+    val_dataset = make_brain_drain_dataset(
+        val_samples, task_mode=task_mode, labels_cfg=labels_cfg, temporal_cfg=temporal_cfg,
+    )
+    test_dataset = make_brain_drain_dataset(
+        test_samples, task_mode=task_mode, labels_cfg=labels_cfg, temporal_cfg=temporal_cfg,
+    )
+    if _temporal_enabled(cfg):
+        print(
+            f"  Inter-window temporal: {temporal_cfg.get('type')} "
+            f"(num_windows={temporal_cfg.get('num_windows', 5)}, "
+            f"hidden={temporal_cfg.get('hidden_size', 128)})"
+        )
 
     val_loader  = DataLoader(val_dataset,  batch_size=cfg.training.batch_size, shuffle=False, num_workers=0)
     test_loader = DataLoader(test_dataset, batch_size=cfg.training.batch_size, shuffle=False, num_workers=0)
@@ -872,6 +920,8 @@ def _save_loso_results(
         "fold_metrics": all_fold_metrics,
         "summary": summary,
         "task_mode": task_mode,
+        "fusion_mode": cfg.model.get("fusion_mode", "cross_attn_pooled"),
+        "temporal_signature": _temporal_signature(cfg),
     }
     if extra_meta:
         payload.update(extra_meta)
@@ -893,6 +943,13 @@ def _load_loso_fold_metrics(cfg, results_filename: str) -> list | None:
     if not results_path.is_file():
         return None
     data = torch.load(results_path, weights_only=False)
+    if not _loso_meta_matches_cfg(cfg, data):
+        print(
+            f"LOSO results at {results_path} do not match current temporal/fusion config "
+            f"(saved={data.get('temporal_signature')}, current={_temporal_signature(cfg)}) "
+            "— re-running step 05."
+        )
+        return None
     fold_metrics = data.get("fold_metrics", [])
     if _fold_metrics_have_predictions(fold_metrics):
         print(f"Reusing existing LOSO results: {results_path}")
@@ -916,7 +973,12 @@ def _evaluate_fold_checkpoint(
     task_mode = _task_mode(cfg)
     criterion = _build_criterion(cfg)
     test_loader = DataLoader(
-        BrainDrainDataset(test_samples, task_mode=task_mode, labels_cfg=cfg.labels),
+        make_brain_drain_dataset(
+            test_samples,
+            task_mode=task_mode,
+            labels_cfg=cfg.labels,
+            temporal_cfg=_temporal_cfg(cfg),
+        ),
         batch_size=cfg.training.batch_size,
         shuffle=False,
         num_workers=0,
@@ -1089,8 +1151,10 @@ def _main_va_separated_classify(cfg) -> None:
     merged_path = Path(cfg.paths.data_processed) / "loso_results.pt"
     if merged_path.is_file():
         data = torch.load(merged_path, weights_only=False)
-        if data.get("task_mode") == _VA_SEPARATED_MODE and _fold_metrics_have_predictions(
-            data.get("fold_metrics", []),
+        if (
+            data.get("task_mode") == _VA_SEPARATED_MODE
+            and _loso_meta_matches_cfg(cfg, data)
+            and _fold_metrics_have_predictions(data.get("fold_metrics", []))
         ):
             print(f"Merged separated results already exist: {merged_path}")
             for key, value in data.get("summary", {}).items():

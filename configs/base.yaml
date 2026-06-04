@@ -76,6 +76,16 @@ model:
   #   sequence_cross_attn -> audio query attends over the BiGRU output sequence (extra option)
   fusion_mode: "cross_attn_pooled"
 
+  # Optional inter-window temporal over fused z (after fusion, before head).
+  # enabled=false → single-window behavior (unchanged).
+  temporal:
+    enabled: false
+    type: "none"              # "none" | "gru" | "lstm"
+    num_windows: 5            # causal context length (25 s at 5 s granularity)
+    hidden_size: 128
+    num_layers: 1
+    bidirectional: false      # keep false for causal debate-time modeling
+
   # ── regression_va settings ─────────────────────────────────────────────────
   # Loss applied independently per head; combined as w_a * L_a + w_v * L_v.
   va_loss: "smooth_l1"          # "smooth_l1" | "mse"

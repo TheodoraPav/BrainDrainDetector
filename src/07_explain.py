@@ -33,10 +33,10 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from models.classifier import BrainDrainDetector
 from data.dataset import (
-    BrainDrainDataset,
     load_all_samples,
     build_loso_splits,
     get_all_participant_ids,
+    make_brain_drain_dataset,
 )
 from utils.plotting import plot_attention_map, plot_attention_over_time
 
@@ -55,6 +55,9 @@ def extract_attention_weights(
         sequence_cross_attn  -> (num_heads, 1, T)
     """
     waveform, biosignals, _ = batch
+    if waveform.dim() == 3:
+        waveform = waveform[:, -1, :]
+        biosignals = biosignals[:, -1, :, :]
     waveform   = waveform.to(device)
     biosignals = biosignals.to(device)
 
@@ -130,7 +133,13 @@ def main(cfg):
             continue
 
         _, test_samples = build_loso_splits(samples, test_participant)
-        test_dataset    = BrainDrainDataset(test_samples)
+        temporal_cfg = dict(cfg.model.get("temporal", {}) or {})
+        test_dataset = make_brain_drain_dataset(
+            test_samples,
+            task_mode=cfg.task.get("mode", "classification"),
+            labels_cfg=cfg.labels,
+            temporal_cfg=temporal_cfg,
+        )
         test_loader     = DataLoader(test_dataset, batch_size=8, shuffle=False, num_workers=0)
 
         model = BrainDrainDetector(dict(cfg.model)).to(device)
