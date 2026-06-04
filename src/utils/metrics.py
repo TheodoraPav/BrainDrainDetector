@@ -50,6 +50,7 @@ def compute_binary_alarm_metrics(
     recall  = recall_score(true_binary, pred_binary, pos_label=1, zero_division=0)
     prec    = precision_score(true_binary, pred_binary, pos_label=1, zero_division=0)
     f1      = f1_score(true_binary, pred_binary, pos_label=1, zero_division=0)
+    macro_f1 = f1_score(true_binary, pred_binary, average="macro", zero_division=0)
 
     tn, fp, fn, tp = confusion_matrix(true_binary, pred_binary, labels=[0, 1]).ravel()
     specificity = float(tn) / max(float(tn + fp), 1.0)
@@ -60,6 +61,7 @@ def compute_binary_alarm_metrics(
         "recall_alarm":            round(float(recall), 4),
         "precision_alarm":         round(float(prec), 4),
         "f1_alarm":                round(float(f1), 4),
+        "macro_f1":                round(float(macro_f1), 4),
         "specificity_safe":        round(specificity, 4),
     }
 

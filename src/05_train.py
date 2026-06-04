@@ -690,7 +690,7 @@ def train_one_fold(
     checkpoints_dir = Path(cfg.paths.checkpoints)
     checkpoints_dir.mkdir(parents=True, exist_ok=True)
 
-    best_score     = 0.0
+    best_score     = float("-inf")
     best_ckpt_path = checkpoints_dir / f"best_{test_participant}.pt"
     use_amp  = _training_use_amp(cfg, device)
     scaler   = torch.amp.GradScaler("cuda") if use_amp else None
