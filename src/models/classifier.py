@@ -70,6 +70,7 @@ class BrainDrainDetector(nn.Module):
             hidden_size=cfg["biosignal_hidden_size"],
             num_layers=cfg["biosignal_num_layers"],
             return_sequence=biosignal_returns_sequence,
+            physio_cnn=cfg.get("physio_cnn", {}),
         )
 
         project_dim = cfg["biosignal_hidden_size"] * 2

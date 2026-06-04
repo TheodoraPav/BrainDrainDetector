@@ -137,17 +137,28 @@ def _temporal_enabled(cfg) -> bool:
     return str(t.get("type", "none")).lower() not in ("none", "off", "")
 
 
+def _physio_cnn_cfg(cfg) -> dict:
+    return dict(cfg.model.get("physio_cnn", {}) or {})
+
+
 def _temporal_signature(cfg) -> dict:
     """Stable metadata stored in loso_results.pt to detect stale skip-if-exists runs."""
     t = _temporal_cfg(cfg)
     enabled = _temporal_enabled(cfg)
-    return {
+    pc = _physio_cnn_cfg(cfg)
+    pc_on = bool(pc.get("enabled", False))
+    sig = {
         "enabled": enabled,
         "type": str(t.get("type", "none")).lower() if enabled else "none",
         "num_windows": int(t.get("num_windows", 5)) if enabled else 1,
         "hidden_size": int(t.get("hidden_size", 128)) if enabled else 0,
         "bidirectional": bool(t.get("bidirectional", False)) if enabled else False,
+        "physio_cnn_enabled": pc_on,
     }
+    if pc_on:
+        sig["physio_cnn_out_channels"] = int(pc.get("out_channels", 32))
+        sig["physio_cnn_kernel_size"] = int(pc.get("kernel_size", 5))
+    return sig
 
 
 def _loso_meta_matches_cfg(cfg, data: dict) -> bool:
@@ -157,7 +168,7 @@ def _loso_meta_matches_cfg(cfg, data: dict) -> bool:
     saved = data.get("temporal_signature")
     current = _temporal_signature(cfg)
     if saved is None:
-        return not current["enabled"]
+        return not current["enabled"] and not current["physio_cnn_enabled"]
     return saved == current
 
 
@@ -576,6 +587,13 @@ def train_one_fold(
     test_dataset = make_brain_drain_dataset(
         test_samples, task_mode=task_mode, labels_cfg=labels_cfg, temporal_cfg=temporal_cfg,
     )
+    physio_cnn = _physio_cnn_cfg(cfg)
+    if bool(physio_cnn.get("enabled", False)):
+        print(
+            f"  Physio encoder: 1D CNN + BiGRU "
+            f"(out_channels={physio_cnn.get('out_channels', 32)}, "
+            f"kernel={physio_cnn.get('kernel_size', 5)})"
+        )
     if _temporal_enabled(cfg):
         print(
             f"  Inter-window temporal: {temporal_cfg.get('type')} "

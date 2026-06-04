@@ -67,6 +67,13 @@ model:
   freeze_audio_backbone: true
   biosignal_hidden_size: 128
   biosignal_num_layers: 2
+  # Optional 1D CNN before BiGRU on physio sequence (~50 steps inside each 5 s window).
+  physio_cnn:
+    enabled: false
+    out_channels: 32
+    kernel_size: 5
+    num_layers: 1
+    dropout: 0.1
   fusion_num_heads: 4
   fusion_dropout: 0.1
   # Used by classification only (always 2: Safe / Alarm).
