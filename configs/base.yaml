@@ -84,6 +84,7 @@ model:
   # Fusion layer selection.
   #   cross_attn_pooled   -> baseline cross-attention with a pooled biosignal token (default)
   #   sequence_cross_attn -> audio query attends over the BiGRU output sequence (extra option)
+  #   late_fusion         -> late fusion of audio and biosignals (concatenation baseline)
   fusion_mode: "cross_attn_pooled"
 
   # Optional inter-window temporal over fused z (after fusion, before head).

@@ -372,44 +372,19 @@ def main(cfg):
 
         if participant_num in debate_intervals:
             debate_start_ms, debate_end_ms = debate_intervals[participant_num]
-        else:
-            debate_start_ms, debate_end_ms = None, None
-
-        # Participant-level z-score normalization
-        normalized_signal_dict = {}
-        for signal_name, (timestamps, values) in signal_dict.items():
-            if debate_start_ms is not None and debate_end_ms is not None:
-                mask = (timestamps >= debate_start_ms) & (timestamps <= debate_end_ms)
-                debate_values = values[mask]
-                if len(debate_values) > 0:
-                    mean = debate_values.mean()
-                    std = debate_values.std()
-                else:
-                    mean = values.mean()
-                    std = values.std()
-            else:
-                mean = values.mean()
-                std = values.std()
-
-            if std < 1e-8:
-                std = 1.0
-
-            normalized_values = (values - mean) / std
-            normalized_signal_dict[signal_name] = (timestamps, normalized_values)
-
-        if debate_start_ms is not None and debate_end_ms is not None:
             windows = extract_debate_windows(
-                normalized_signal_dict, debate_start_ms, debate_end_ms, window_size_sec, target_steps_per_window
+                signal_dict, debate_start_ms, debate_end_ms, window_size_sec, target_steps_per_window
             )
         else:
-            windows = extract_windows_legacy(normalized_signal_dict, window_size_sec, target_steps_per_window)
+            windows = extract_windows_legacy(signal_dict, window_size_sec, target_steps_per_window)
 
         counts_by_participant[participant_id] = len(windows)
         print(f"  {participant_id}: {len(windows)} physio windows extracted")
 
         for window_dict in windows:
+            biosignals = z_score_normalize(window_dict["biosignals"])
             save_dict = {
-                "biosignals": window_dict["biosignals"],
+                "biosignals": biosignals,
                 "participant": participant_id,
                 "seconds": window_dict["seconds"],
             }

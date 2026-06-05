@@ -122,6 +122,9 @@ def main(cfg):
     figures_dir      = str(Path(cfg.paths.figures) / "attention_maps")
 
     fusion_mode = cfg.model.get("fusion_mode", "cross_attn_pooled")
+    if fusion_mode == "late_fusion":
+        print("Late fusion does not use attention weights. Skipping explainability plots.")
+        return
     print(f"Generating attention maps for {len(participant_ids)} LOSO folds.")
     print(f"Active fusion_mode: {fusion_mode}")
 

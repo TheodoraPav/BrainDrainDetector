@@ -176,6 +176,44 @@ class SequenceCrossAttentionFusion(nn.Module):
         return fused
 
 
+class LateFusion(nn.Module):
+    """Concatenation-based late fusion of audio and biosignals (baseline)."""
+
+    def __init__(
+        self,
+        audio_dim: int,
+        biosignal_dim: int,
+        project_dim: int,
+        dropout: float,
+    ):
+        super().__init__()
+        half_dim = project_dim // 2
+        self.audio_proj = nn.Linear(audio_dim, half_dim)
+        self.biosignal_proj = nn.Linear(biosignal_dim, half_dim)
+        self.layer_norm = nn.LayerNorm(project_dim)
+        self.dropout = nn.Dropout(dropout)
+        
+        # Late fusion doesn't use attention, so weights are None
+        self.last_attention_weights = None
+
+    def forward(
+        self,
+        audio_emb: torch.Tensor,
+        biosignal_emb: torch.Tensor,
+    ) -> torch.Tensor:
+        # If biosignal_emb is a sequence (batch, time_steps, biosignal_dim), average-pool it
+        if biosignal_emb.dim() == 3:
+            biosignal_emb = biosignal_emb.mean(dim=1)
+
+        audio_proj = self.audio_proj(audio_emb)
+        bio_proj = self.biosignal_proj(biosignal_emb)
+        
+        fused = torch.cat([audio_proj, bio_proj], dim=-1)
+        fused = self.layer_norm(fused)
+        fused = self.dropout(fused)
+        return fused
+
+
 def build_fusion_layer(
     fusion_mode: str,
     audio_dim: int,
@@ -190,6 +228,7 @@ def build_fusion_layer(
     Allowed values:
       - "cross_attn_pooled"   -> CrossAttentionFusion         (default)
       - "sequence_cross_attn" -> SequenceCrossAttentionFusion (extra option)
+      - "late_fusion"         -> LateFusion                   (concatenation-based baseline)
     """
     if fusion_mode == "cross_attn_pooled":
         return CrossAttentionFusion(
@@ -209,7 +248,15 @@ def build_fusion_layer(
             dropout=dropout,
         )
 
+    if fusion_mode == "late_fusion":
+        return LateFusion(
+            audio_dim=audio_dim,
+            biosignal_dim=biosignal_dim,
+            project_dim=project_dim,
+            dropout=dropout,
+        )
+
     raise ValueError(
         f"Unknown fusion_mode: {fusion_mode!r}. "
-        f"Allowed values: 'cross_attn_pooled', 'sequence_cross_attn'."
+        f"Allowed values: 'cross_attn_pooled', 'sequence_cross_attn', 'late_fusion'."
     )
