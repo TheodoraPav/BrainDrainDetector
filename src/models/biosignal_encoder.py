@@ -9,18 +9,14 @@ Input signals (concatenated as channels):
 Architecture: optional 1D CNN (local patterns) + bidirectional GRU.
 BiGRU is chosen over LSTM to reduce the risk of overfitting on this medium-sized dataset.
 
+Single encoder (default):
+  All channels -> one BiGRU -> (batch, hidden_size * 2) or sequence.
+
+Dual-tower encoder (model.dual_tower_biosignal: true):
+  E4 channels -> BiGRU(hidden_size // 2)  \
+  EEG channels -> BiGRU(hidden_size // 2)  / -> concat -> same output dim as single encoder.
+
 Input shape : (batch, time_steps, num_signals)
-
-Output shape depends on the constructor flag `return_sequence`:
-  - return_sequence = False (default, used by cross_attn_pooled fusion):
-        (batch, hidden_size * 2)
-        The forward and backward last hidden states are concatenated.
-  - return_sequence = True (used by sequence_cross_attn fusion):
-        (batch, time_steps, hidden_size * 2)
-        The full BiGRU output at every time step.
-
-Both modes share the same trainable parameters. The flag only changes which
-tensor is returned.
 """
 
 from __future__ import annotations
@@ -40,26 +36,17 @@ def _normalize_physio_cnn_cfg(physio_cnn: dict | None) -> dict:
     }
 
 
-class BiosignalEncoder(nn.Module):
+class _BiGRUTower(nn.Module):
+    """Optional 1D CNN + bidirectional GRU on one signal group."""
 
     def __init__(
         self,
         num_signals: int,
         hidden_size: int,
         num_layers: int,
-        return_sequence: bool = False,
+        return_sequence: bool,
         physio_cnn: dict | None = None,
     ):
-        """
-        Args:
-            num_signals:     number of input channels (e.g. 6 for EDA+HR+IBI+theta+alpha+beta)
-            hidden_size:     GRU hidden units per direction
-            num_layers:      number of stacked GRU layers
-            return_sequence: if True, forward returns the BiGRU output sequence
-                             (batch, time_steps, hidden_size*2) instead of the
-                             pooled last-hidden-state vector.
-            physio_cnn:      model.physio_cnn config (enabled, out_channels, kernel_size, ...)
-        """
         super().__init__()
         self.return_sequence = return_sequence
         self.physio_cnn_cfg = _normalize_physio_cnn_cfg(physio_cnn)
@@ -99,19 +86,16 @@ class BiosignalEncoder(nn.Module):
             bidirectional=True,
             dropout=0.1 if num_layers > 1 else 0.0,
         )
-        self.embedding_dim = hidden_size * 2  # bidirectional
+        self.output_dim = hidden_size * 2
 
     def uses_physio_cnn(self) -> bool:
         return self.cnn is not None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (batch, time_steps, num_signals)
         if self.cnn is not None:
             x = self.cnn(x.transpose(1, 2)).transpose(1, 2)
 
         sequence, hidden = self.gru(x)
-        # sequence: (batch, time_steps, hidden_size*2)
-        # hidden:   (num_layers*2, batch, hidden_size)
 
         if self.return_sequence:
             return sequence
@@ -119,3 +103,109 @@ class BiosignalEncoder(nn.Module):
         forward_hidden = hidden[-2]
         backward_hidden = hidden[-1]
         return torch.cat([forward_hidden, backward_hidden], dim=1)
+
+
+class BiosignalEncoder(nn.Module):
+
+    def __init__(
+        self,
+        num_signals: int,
+        hidden_size: int,
+        num_layers: int,
+        return_sequence: bool = False,
+        physio_cnn: dict | None = None,
+    ):
+        super().__init__()
+        self.return_sequence = return_sequence
+        self.tower = _BiGRUTower(
+            num_signals=num_signals,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            return_sequence=return_sequence,
+            physio_cnn=physio_cnn,
+        )
+        self.embedding_dim = self.tower.output_dim
+
+    def uses_physio_cnn(self) -> bool:
+        return self.tower.uses_physio_cnn()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.tower(x)
+
+
+class DualTowerBiosignalEncoder(nn.Module):
+    """
+    Separate BiGRU encoders for E4 and EEG, then concatenate outputs.
+
+    Each tower uses hidden_size = biosignal_hidden_size // 2 so the final
+    embedding dim matches the single BiGRU encoder (biosignal_hidden_size * 2).
+    """
+
+    def __init__(
+        self,
+        num_e4_signals: int,
+        num_eeg_signals: int,
+        hidden_size: int,
+        num_layers: int,
+        return_sequence: bool = False,
+        physio_cnn: dict | None = None,
+    ):
+        super().__init__()
+        self.return_sequence = return_sequence
+        self.num_e4_signals = num_e4_signals
+
+        tower_hidden = max(1, hidden_size // 2)
+        self.e4_tower = _BiGRUTower(
+            num_signals=num_e4_signals,
+            hidden_size=tower_hidden,
+            num_layers=num_layers,
+            return_sequence=return_sequence,
+            physio_cnn=physio_cnn,
+        )
+        self.eeg_tower = _BiGRUTower(
+            num_signals=num_eeg_signals,
+            hidden_size=tower_hidden,
+            num_layers=num_layers,
+            return_sequence=return_sequence,
+            physio_cnn=physio_cnn,
+        )
+        self.embedding_dim = self.e4_tower.output_dim + self.eeg_tower.output_dim
+
+    def uses_physio_cnn(self) -> bool:
+        return self.e4_tower.uses_physio_cnn() or self.eeg_tower.uses_physio_cnn()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        e4 = x[..., : self.num_e4_signals]
+        eeg = x[..., self.num_e4_signals :]
+        e4_out = self.e4_tower(e4)
+        eeg_out = self.eeg_tower(eeg)
+        return torch.cat([e4_out, eeg_out], dim=-1)
+
+
+def build_biosignal_encoder(
+    *,
+    dual_tower: bool,
+    num_e4_signals: int,
+    num_eeg_signals: int,
+    hidden_size: int,
+    num_layers: int,
+    return_sequence: bool,
+    physio_cnn: dict | None = None,
+) -> nn.Module:
+    if dual_tower:
+        return DualTowerBiosignalEncoder(
+            num_e4_signals=num_e4_signals,
+            num_eeg_signals=num_eeg_signals,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            return_sequence=return_sequence,
+            physio_cnn=physio_cnn,
+        )
+
+    return BiosignalEncoder(
+        num_signals=num_e4_signals + num_eeg_signals,
+        hidden_size=hidden_size,
+        num_layers=num_layers,
+        return_sequence=return_sequence,
+        physio_cnn=physio_cnn,
+    )

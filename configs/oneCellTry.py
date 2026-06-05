@@ -39,6 +39,11 @@ TASK_MODE = "classification"        # "classification" | "regression_va"
 FUSION_MODE = "sequence_cross_attn"   # "cross_attn_pooled" | "sequence_cross_attn"
 AUGMENTATION_ENABLED = False        # no augmentation
 
+# 1D CNN before BiGRU on physio (~50 steps inside each 5 s window).
+PHYSIO_CNN_ENABLED = True
+PHYSIO_CNN_OUT_CHANNELS = 32
+PHYSIO_CNN_KERNEL_SIZE = 5
+
 EPOCHS = 50          # LOSO = 27 separate models, each up to EPOCHS (not 27× per global epoch)
 EARLY_STOPPING_PATIENCE = 8   # 0 = always run all EPOCHS; saves GPU when val F1 plateaus
 CACHE_AUDIO_EMBEDDINGS = True   # one Wav2Vec2 pass per window, then train on 768-d vectors
@@ -394,6 +399,9 @@ cfg.training.use_amp = bool(USE_AMP)
 cfg.task.mode = TASK_MODE
 cfg.model.fusion_mode = FUSION_MODE
 cfg.model.freeze_audio_backbone = True
+cfg.model.physio_cnn.enabled = bool(PHYSIO_CNN_ENABLED)
+cfg.model.physio_cnn.out_channels = int(PHYSIO_CNN_OUT_CHANNELS)
+cfg.model.physio_cnn.kernel_size = int(PHYSIO_CNN_KERNEL_SIZE)
 cfg.augmentation.enabled = bool(AUGMENTATION_ENABLED)
 
 # Align selection_metric to task mode
@@ -407,6 +415,11 @@ OmegaConf.save(cfg, cfg_path)
 print("Config:", cfg_path)
 print("  task_mode:", cfg.task.mode)
 print("  fusion_mode:", cfg.model.fusion_mode)
+print(
+    "  physio_cnn:",
+    cfg.model.physio_cnn.enabled,
+    f"(out={cfg.model.physio_cnn.out_channels}, kernel={cfg.model.physio_cnn.kernel_size})",
+)
 print("  augmentation:", cfg.augmentation.enabled)
 print("  selection_metric:", cfg.training.selection_metric)
 print("  epochs:", cfg.training.epochs, "| batch_size:", cfg.training.batch_size)

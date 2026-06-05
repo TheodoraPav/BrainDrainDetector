@@ -67,6 +67,9 @@ model:
   freeze_audio_backbone: true
   biosignal_hidden_size: 128
   biosignal_num_layers: 2
+  # false -> one BiGRU on all 6 channels (default)
+  # true  -> separate BiGRU for E4 and EEG, then concat (64+64 -> 256-d when hidden_size=128)
+  dual_tower_biosignal: false
   # Optional 1D CNN before BiGRU on physio sequence (~50 steps inside each 5 s window).
   physio_cnn:
     enabled: false

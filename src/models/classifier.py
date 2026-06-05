@@ -29,7 +29,7 @@ import torch
 import torch.nn as nn
 
 from .audio_encoder import AudioEncoder
-from .biosignal_encoder import BiosignalEncoder
+from .biosignal_encoder import build_biosignal_encoder
 from .fusion import build_fusion_layer
 from .temporal import build_inter_window_temporal, temporal_output_dim
 
@@ -60,13 +60,15 @@ class BrainDrainDetector(nn.Module):
                 freeze_backbone=cfg.get("freeze_audio_backbone", True),
             )
 
-        num_signals = len(cfg.get("e4_signals",  ["EDA", "HR", "IBI"])) + \
-                      len(cfg.get("eeg_signals", ["theta", "alpha", "beta"]))
+        e4_signals  = cfg.get("e4_signals",  ["EDA", "HR", "IBI"])
+        eeg_signals = cfg.get("eeg_signals", ["theta", "alpha", "beta"])
 
         biosignal_returns_sequence = self.fusion_mode == "sequence_cross_attn"
 
-        self.biosignal_encoder = BiosignalEncoder(
-            num_signals=num_signals,
+        self.biosignal_encoder = build_biosignal_encoder(
+            dual_tower=bool(cfg.get("dual_tower_biosignal", False)),
+            num_e4_signals=len(e4_signals),
+            num_eeg_signals=len(eeg_signals),
             hidden_size=cfg["biosignal_hidden_size"],
             num_layers=cfg["biosignal_num_layers"],
             return_sequence=biosignal_returns_sequence,
