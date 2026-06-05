@@ -28,7 +28,9 @@ from omegaconf import OmegaConf
 CELL_VERSION = "2026-06-04-v21-classify-sequence-cross-attn"  # printed at run — if missing in log, paste latest cell
 print(f"BrainDrainDetector Kaggle cell {CELL_VERSION}")
 
-REPO = Path("/kaggle/working/BrainDrainDetector")
+WORKING_ROOT = Path("/kaggle/working")
+REPO = WORKING_ROOT / "BrainDrainDetector"
+run_config_copy = WORKING_ROOT / "kaggle_run_config.yaml"
 GIT_URL = "https://github.com/TheodoraPav/BrainDrainDetector.git"
 GIT_BRANCH = "master"  # branch with your latest pushed code
 
@@ -36,11 +38,11 @@ KAGGLE_DATASET_SLUG = "braindraindataset"
 
 # Baseline experiment knobs (keep as-is for simplest classification run)
 TASK_MODE = "classification"        # "classification" | "regression_va"
-FUSION_MODE = "sequence_cross_attn"   # "cross_attn_pooled" | "sequence_cross_attn"
+FUSION_MODE = "cross_attn_pooled"   # "cross_attn_pooled" | "sequence_cross_attn"
 AUGMENTATION_ENABLED = False        # no augmentation
 
 # 1D CNN before BiGRU on physio (~50 steps inside each 5 s window).
-PHYSIO_CNN_ENABLED = True
+PHYSIO_CNN_ENABLED = False
 PHYSIO_CNN_OUT_CHANNELS = 32
 PHYSIO_CNN_KERNEL_SIZE = 5
 
@@ -68,7 +70,7 @@ SEED_CHECKPOINTS_FROM_DATASET = False  # True only for recovery without retraini
 #   FORCE_RERUN_STEPS = ["05", "06"]
 # VA / fresh tensors (default when TASK_MODE=regression_va — auto-filled below if empty):
 #   FORCE_RERUN_STEPS = ["01", "04", "05", "06"]
-FORCE_RERUN_STEPS: list[str] = []
+FORCE_RERUN_STEPS: list[str] = ["03", "04", "05", "06"]
 
 # Auto force-rerun steps that must be rebuilt for the active task (when FORCE_RERUN_STEPS is empty)
 AUTO_FORCE_RERUN_FOR_TASK = True
@@ -412,6 +414,7 @@ else:
 
 cfg_path = REPO / f"configs/kaggle_{TASK_MODE}_{FUSION_MODE}.yaml"
 OmegaConf.save(cfg, cfg_path)
+shutil.copy2(cfg_path, run_config_copy)
 print("Config:", cfg_path)
 print("  task_mode:", cfg.task.mode)
 print("  fusion_mode:", cfg.model.fusion_mode)
@@ -778,3 +781,157 @@ print("  figures:       ", cfg.paths.figures)
 print("\n[Kaggle] CELL 1 DONE.")
 print("For new experiments (different fusion/aug/epochs) without redoing audio:")
 print("  → use notebooks/kaggle_rerun_experiment_cell.py in a NEW cell")
+
+
+# -------------------------
+# 7) Zip results for download (figures + loso_results.pt)
+# -------------------------
+import zipfile
+import json
+
+SAVE_RESULTS_ZIP = True
+# None → auto name from task / fusion / weighted_loss / augmentation
+ZIP_OUTPUT_NAME: str | None = None
+
+
+def _build_results_zip_name() -> str:
+    aug = "aug" if cfg.augmentation.enabled else "no_aug"
+    wl = "weighted" if cfg.training.get("weighted_loss", True) else "unweighted"
+    return f"results_{cfg.task.mode}_{cfg.model.fusion_mode}_{wl}_{aug}.zip"
+
+
+def _data_processed_artifacts_for_task(task_mode: str) -> list[str]:
+    """Flat filenames under data_processed/ to include in the zip."""
+    common = [
+        "loso_results.pt",
+        "labels.csv",
+        "annotations.csv",
+        "threshold_tuning_results.json",
+        "threshold_sweep.csv",
+    ]
+    if task_mode == "va_separated_classify":
+        return common + [
+            "loso_results_arousal.pt",
+            "loso_results_valence.pt",
+            "hl_evaluation_report_arousal.json",
+            "hl_evaluation_report_valence.json",
+            "derived_alarm_evaluation_report.json",
+            "derived_alarm_per_window.csv",
+        ]
+    if task_mode == "regression_va":
+        return common + [
+            "va_evaluation_report.json",
+            "derived_alarm_evaluation_report.json",
+            "derived_alarm_per_window.csv",
+        ]
+    return common
+
+
+def _figures_zip_arcname(file_path: Path, figures_dir: Path) -> str:
+    rel = file_path.resolve().relative_to(figures_dir.resolve())
+    return str(Path("figures") / rel).replace("\\", "/")
+
+
+def _data_processed_zip_arcname(filename: str) -> str:
+    return f"data_processed/{filename}"
+
+
+def zip_run_results(
+    zip_path: Path,
+    figures_dir: Path,
+    data_processed_dir: Path,
+    *,
+    extra_files: list[tuple[Path, str]] | None = None,
+    required_in_zip: list[str] | None = None,
+) -> list[str]:
+    """
+    Pack results with fixed top-level folders (figures/, data_processed/, configs/).
+
+    Extract anywhere: unzip → figures/... and data_processed/loso_results.pt
+    """
+    zip_path = Path(zip_path)
+    figures_dir = Path(figures_dir)
+    data_processed_dir = Path(data_processed_dir)
+    if zip_path.exists():
+        zip_path.unlink()
+
+    written: list[str] = []
+    task_mode = str(cfg.task.mode)
+
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
+        if figures_dir.is_dir():
+            for file_path in sorted(figures_dir.rglob("*")):
+                if file_path.is_file():
+                    arc = _figures_zip_arcname(file_path, figures_dir)
+                    zipf.write(file_path, arc)
+                    written.append(arc)
+        else:
+            print(f"[Kaggle] Warning: figures dir not found: {figures_dir}")
+
+        for name in _data_processed_artifacts_for_task(task_mode):
+            file_path = data_processed_dir / name
+            if file_path.is_file():
+                arc = _data_processed_zip_arcname(name)
+                zipf.write(file_path, arc)
+                written.append(arc)
+
+        for src, arc in extra_files or []:
+            src = Path(src)
+            if src.is_file():
+                zipf.write(src, arc.replace("\\", "/"))
+                written.append(arc.replace("\\", "/"))
+
+    if not written:
+        raise RuntimeError(
+            f"[Kaggle] Zip is empty — no files packed to {zip_path}. "
+            "Check that step 05/06 finished and paths exist."
+        )
+
+    missing_required = [
+        r for r in (required_in_zip or [])
+        if r not in written
+    ]
+    if missing_required:
+        raise RuntimeError(
+            f"[Kaggle] Zip missing required entries: {missing_required}. "
+            f"Packed {len(written)} file(s): {written[:8]}..."
+        )
+
+    size_mb = zip_path.stat().st_size / (1024 * 1024)
+    print(f"[Kaggle] Zipped {len(written)} file(s) -> {zip_path} ({size_mb:.2f} MB)")
+    print("  Layout: figures/...  data_processed/loso_results.pt  kaggle_run_config.yaml")
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        names = zf.namelist()
+        if "data_processed/loso_results.pt" in names:
+            print("  Verified: data_processed/loso_results.pt inside zip")
+        else:
+            print("  WARNING: data_processed/loso_results.pt NOT in zip — re-run step 05")
+    return written
+
+
+if SAVE_RESULTS_ZIP:
+    zip_name = ZIP_OUTPUT_NAME or _build_results_zip_name()
+    zip_out = WORKING_ROOT / zip_name
+    manifest = {
+        "cell_version": CELL_VERSION,
+        "task_mode": TASK_MODE,
+        "fusion_mode": FUSION_MODE,
+        "force_rerun_steps": FORCE_RERUN_STEPS,
+        "seed_folders": SEED_DATASET_FOLDERS,
+    }
+    manifest_path = WORKING_ROOT / "run_manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    zip_run_results(
+        zip_out,
+        Path(cfg.paths.figures),
+        PROCESSED,
+        extra_files=[
+            (run_config_copy, "kaggle_run_config.yaml"),
+            (manifest_path, "run_manifest.json"),
+            (cfg_path, f"configs/{cfg_path.name}"),
+        ],
+        required_in_zip=["data_processed/loso_results.pt"],
+    )
+    print("Download from Kaggle Output tab (right sidebar).")
+    print(f"  Local extract: unzip {zip_name} -d ./my_run")
