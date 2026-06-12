@@ -87,6 +87,12 @@ model:
   #   late_fusion         -> late fusion of audio and biosignals (concatenation baseline)
   fusion_mode: "cross_attn_pooled"
 
+  # Single-modality ablation (zeros the other branch after encoding, before fusion).
+  #   full        — both modalities (default)
+  #   audio_only  — biosignal embedding zeroed
+  #   bio_only    — audio embedding zeroed (after Wav2Vec2 / cache)
+  input_modality: "full"
+
   # Optional inter-window temporal over fused z (after fusion, before head).
   # enabled=false → single-window behavior (unchanged).
   temporal:

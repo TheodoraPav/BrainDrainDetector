@@ -165,6 +165,8 @@ def _loso_meta_matches_cfg(cfg, data: dict) -> bool:
     """False when cached LOSO results were produced with a different temporal setup."""
     if data.get("task_mode") != _task_mode(cfg):
         return False
+    if data.get("input_modality", "full") != cfg.model.get("input_modality", "full"):
+        return False
     saved = data.get("temporal_signature")
     current = _temporal_signature(cfg)
     if saved is None:
@@ -939,6 +941,7 @@ def _save_loso_results(
         "summary": summary,
         "task_mode": task_mode,
         "fusion_mode": cfg.model.get("fusion_mode", "cross_attn_pooled"),
+        "input_modality": cfg.model.get("input_modality", "full"),
         "temporal_signature": _temporal_signature(cfg),
     }
     if extra_meta:

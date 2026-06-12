@@ -36,6 +36,8 @@ from .temporal import build_inter_window_temporal, temporal_output_dim
 
 DEFAULT_FUSION_MODE = "cross_attn_pooled"
 DEFAULT_TASK_MODE   = "classification"
+DEFAULT_INPUT_MODALITY = "full"
+VALID_INPUT_MODALITIES = frozenset({"full", "audio_only", "bio_only"})
 
 
 class BrainDrainDetector(nn.Module):
@@ -51,6 +53,12 @@ class BrainDrainDetector(nn.Module):
 
         self.fusion_mode = cfg.get("fusion_mode", DEFAULT_FUSION_MODE)
         self.task_mode   = cfg.get("task_mode",   DEFAULT_TASK_MODE)
+        self.input_modality = cfg.get("input_modality", DEFAULT_INPUT_MODALITY)
+        if self.input_modality not in VALID_INPUT_MODALITIES:
+            raise ValueError(
+                f"input_modality must be one of {sorted(VALID_INPUT_MODALITIES)}; "
+                f"got {self.input_modality!r}"
+            )
 
         if shared_audio_encoder is not None:
             self.audio_encoder = shared_audio_encoder
@@ -122,6 +130,12 @@ class BrainDrainDetector(nn.Module):
             audio_emb = self.audio_encoder(waveform)
 
         biosignal_output = self.biosignal_encoder(biosignals)
+
+        if self.input_modality == "audio_only":
+            biosignal_output = torch.zeros_like(biosignal_output)
+        elif self.input_modality == "bio_only":
+            audio_emb = torch.zeros_like(audio_emb)
+
         return self.fusion(audio_emb, biosignal_output)
 
     def _apply_temporal(self, fused_seq: torch.Tensor) -> torch.Tensor:
