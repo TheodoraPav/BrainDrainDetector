@@ -1,6 +1,7 @@
 from .audio_encoder import AudioEncoder
 from .biosignal_encoder import BiosignalEncoder, DualTowerBiosignalEncoder, build_biosignal_encoder
 from .fusion import (
+    ConcatFusion,
     CrossAttentionFusion,
     SequenceCrossAttentionFusion,
     build_fusion_layer,
@@ -12,6 +13,7 @@ __all__ = [
     "BiosignalEncoder",
     "DualTowerBiosignalEncoder",
     "build_biosignal_encoder",
+    "ConcatFusion",
     "CrossAttentionFusion",
     "SequenceCrossAttentionFusion",
     "build_fusion_layer",

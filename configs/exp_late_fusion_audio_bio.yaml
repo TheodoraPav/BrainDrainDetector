@@ -1,0 +1,22 @@
+# ============================================================
+# Decision-level late fusion — audio + bio classifiers
+# ============================================================
+defaults:
+  - base
+
+late_fusion:
+  # Paths to uploaded Kaggle dataset experiment folders (local paths below).
+  audio_run_dir: "results/results_classification_cross_attn_pooled_audio_only_weighted_no_aug"
+  bio_run_dir: "results/results_classification_cross_attn_pooled_bio_only_weighted_no_aug"
+  output_root: "results/late_fusion_runs"
+  methods:
+    - uniform_avg
+    - val_f1_weighted
+    - majority_or
+    - stacking_lr
+    - quality_weighted
+  active_method: uniform_avg
+
+paths:
+  data_processed: "data_processed"
+  figures: "figures"
