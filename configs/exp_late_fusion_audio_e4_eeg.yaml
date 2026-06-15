@@ -1,0 +1,37 @@
+# ============================================================
+# Decision-level late fusion — audio + E4 + EEG (3 unimodal towers)
+# Fair comparison vs early cross_attn_pooled (dual_tower_biosignal: true)
+# ============================================================
+defaults:
+  - base
+
+late_fusion:
+  classifier_runs:
+    - name: audio
+      run_dir: "results/results_classification_cross_attn_pooled_audio_only_weighted_no_aug"
+      input_modality: audio_only
+      quality_role: audio
+    - name: e4
+      run_dir: "results/results_late_fusion_3mod_e4_only_weighted_no_aug"
+      input_modality: e4_only
+      quality_role: e4
+      model_overrides:
+        dual_tower_biosignal: true
+    - name: eeg
+      run_dir: "results/results_late_fusion_3mod_eeg_only_weighted_no_aug"
+      input_modality: eeg_only
+      quality_role: eeg
+      model_overrides:
+        dual_tower_biosignal: true
+  output_root: "results/late_fusion_3mod_runs"
+  methods:
+    - uniform_avg
+    - val_f1_weighted
+    - majority_or
+    - stacking_lr
+    - quality_weighted
+  active_method: uniform_avg
+
+paths:
+  data_processed: "data_processed"
+  figures: "figures"

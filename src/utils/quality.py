@@ -96,6 +96,38 @@ def load_participant_e4_quality_means(
     return scores
 
 
+def load_participant_neurosky_quality_means(
+    data_quality_dir: str,
+    signals: list | None = None,
+) -> Dict[str, float]:
+    """
+    Mean NeuroSky / Polar completeness per participant (P1, P2, ...).
+
+    Uses neuro_polar_completeness.csv. Column names are matched case-insensitively
+    against ``signals`` (default: theta, alpha, beta).
+    """
+    import numpy as np
+
+    signal_list = [s.lower() for s in (signals or ["theta", "alpha", "beta"])]
+    df = load_neurosky_quality(data_quality_dir)
+    col_map = {str(c).lower(): c for c in df.columns}
+    scores: Dict[str, float] = {}
+    for idx in range(len(df)):
+        participant = f"P{idx + 1}"
+        row = df.iloc[idx]
+        values: list[float] = []
+        for signal in signal_list:
+            col = col_map.get(signal.lower())
+            if col is None:
+                continue
+            raw = row.get(col)
+            if raw is None or str(raw).strip().lower() == "n/a":
+                continue
+            values.append(float(raw))
+        scores[participant] = float(np.mean(values)) if values else 0.5
+    return scores
+
+
 def build_quality_map(data_quality_dir: str, signals: list = None) -> Dict[int, bool]:
     """
     Builds a dict mapping participant_idx (0-based) → bool (True = perfect quality).

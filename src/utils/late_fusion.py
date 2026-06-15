@@ -1,8 +1,9 @@
 """
 Decision-level late fusion for BrainDrainDetector.
 
-Combines independently trained audio-only and bio-only classifiers at prediction
-time. Fusion weights for val-F1 and stacking are fit on the validation split
+Combines independently trained unimodal classifiers at prediction time.
+Supports 2+ modalities (e.g. audio + bio, or audio + E4 + EEG).
+Fusion weights for val-F1 and stacking are fit on the validation split
 inside each LOSO fold (same protocol as step 05).
 """
 
@@ -28,7 +29,10 @@ from data.splits import (
 from models.classifier import BrainDrainDetector
 from models.audio_encoder import AudioEncoder
 from utils.metrics import average_metrics_across_folds, compute_binary_alarm_metrics
-from utils.quality import load_participant_e4_quality_means
+from utils.quality import (
+    load_participant_e4_quality_means,
+    load_participant_neurosky_quality_means,
+)
 
 FUSION_METHODS = (
     "uniform_avg",
@@ -92,62 +96,66 @@ def labels_from_alarm_scores(scores: list[float], threshold: float = 0.5) -> lis
     return [1 if float(p) >= threshold else 0 for p in scores]
 
 
-def fuse_uniform_avg(probs_a: list, probs_b: list, **_) -> list[float]:
-    return [(prob_alarm(a) + prob_alarm(b)) / 2.0 for a, b in zip(probs_a, probs_b)]
-
-
-def fuse_val_f1_weighted(
-    probs_a: list,
-    probs_b: list,
-    *,
-    val_labels: list[int],
-    val_probs_a: list,
-    val_probs_b: list,
-    **_,
-) -> list[float]:
-    val_pred_a = labels_from_alarm_scores([prob_alarm(p) for p in val_probs_a])
-    val_pred_b = labels_from_alarm_scores([prob_alarm(p) for p in val_probs_b])
-    f1_a = f1_score(val_labels, val_pred_a, pos_label=1, zero_division=0)
-    f1_b = f1_score(val_labels, val_pred_b, pos_label=1, zero_division=0)
-    total = f1_a + f1_b + 1e-8
-    weight_a = f1_a / total
-    weight_b = f1_b / total
+def fuse_uniform_avg_multi(probs_streams: list[list], **_) -> list[float]:
+    n = len(probs_streams[0])
+    k = len(probs_streams)
     return [
-        weight_a * prob_alarm(a) + weight_b * prob_alarm(b)
-        for a, b in zip(probs_a, probs_b)
+        sum(prob_alarm(probs_streams[m][i]) for m in range(k)) / float(k)
+        for i in range(n)
     ]
 
 
-def fuse_majority_or(probs_a: list, probs_b: list, **_) -> list[float]:
+def fuse_val_f1_weighted_multi(
+    probs_streams: list[list],
+    *,
+    val_labels: list[int],
+    val_probs_streams: list[list],
+    **_,
+) -> list[float]:
+    n_modalities = len(probs_streams)
+    val_f1s: list[float] = []
+    for m in range(n_modalities):
+        val_pred = labels_from_alarm_scores([prob_alarm(p) for p in val_probs_streams[m]])
+        val_f1s.append(f1_score(val_labels, val_pred, pos_label=1, zero_division=0))
+    total = sum(val_f1s) + 1e-8
+    weights = [f1 / total for f1 in val_f1s]
+    n = len(probs_streams[0])
+    return [
+        sum(weights[m] * prob_alarm(probs_streams[m][i]) for m in range(n_modalities))
+        for i in range(n)
+    ]
+
+
+def fuse_majority_or_multi(probs_streams: list[list], **_) -> list[float]:
+    n = len(probs_streams[0])
+    k = len(probs_streams)
     fused: list[float] = []
-    for a, b in zip(probs_a, probs_b):
-        alarm = 1.0 if (prob_alarm(a) >= 0.5 or prob_alarm(b) >= 0.5) else 0.0
+    for i in range(n):
+        alarm = 1.0 if any(prob_alarm(probs_streams[m][i]) >= 0.5 for m in range(k)) else 0.0
         fused.append(alarm)
     return fused
 
 
-def fuse_stacking_lr(
-    probs_a: list,
-    probs_b: list,
+def fuse_stacking_lr_multi(
+    probs_streams: list[list],
     *,
     val_labels: list[int],
-    val_probs_a: list,
-    val_probs_b: list,
+    val_probs_streams: list[list],
     **_,
 ) -> list[float]:
     x_val = np.column_stack([
-        [prob_alarm(p) for p in val_probs_a],
-        [prob_alarm(p) for p in val_probs_b],
+        [prob_alarm(p) for p in val_probs_streams[m]]
+        for m in range(len(probs_streams))
     ])
     y_val = np.asarray(val_labels, dtype=np.int64)
     if len(np.unique(y_val)) < 2:
-        return fuse_uniform_avg(probs_a, probs_b)
+        return fuse_uniform_avg_multi(probs_streams)
 
     clf = LogisticRegression(max_iter=2000, class_weight="balanced")
     clf.fit(x_val, y_val)
     x_test = np.column_stack([
-        [prob_alarm(p) for p in probs_a],
-        [prob_alarm(p) for p in probs_b],
+        [prob_alarm(p) for p in probs_streams[m]]
+        for m in range(len(probs_streams))
     ])
     if hasattr(clf, "predict_proba"):
         proba = clf.predict_proba(x_test)
@@ -157,25 +165,73 @@ def fuse_stacking_lr(
     return [float(v) for v in clf.predict(x_test)]
 
 
-def fuse_quality_weighted(
-    probs_a: list,
-    probs_b: list,
+def fuse_quality_weighted_multi(
+    probs_streams: list[list],
     *,
     window_keys: list[tuple[str, int]],
     speech_overlap_index: dict[tuple[str, int], float],
-    bio_quality_by_participant: dict[str, float],
+    modality_quality_roles: list[str],
+    e4_quality_by_participant: dict[str, float],
+    eeg_quality_by_participant: dict[str, float],
     window_size_sec: float = 5.0,
     **_,
 ) -> list[float]:
     fused: list[float] = []
-    for (participant, seconds), a, b in zip(window_keys, probs_a, probs_b):
-        overlap = speech_overlap_index.get((participant, seconds), 0.6 * window_size_sec)
-        q_audio = max(overlap / window_size_sec, 1e-3)
-        q_bio = max(float(bio_quality_by_participant.get(participant, 0.5)), 1e-3)
-        weight_a = q_audio / (q_audio + q_bio)
-        weight_b = q_bio / (q_audio + q_bio)
-        fused.append(weight_a * prob_alarm(a) + weight_b * prob_alarm(b))
+    for i, (participant, seconds) in enumerate(window_keys):
+        weights: list[float] = []
+        for role in modality_quality_roles:
+            if role == "audio":
+                overlap = speech_overlap_index.get((participant, seconds), 0.6 * window_size_sec)
+                weights.append(max(overlap / window_size_sec, 1e-3))
+            elif role == "e4":
+                weights.append(max(float(e4_quality_by_participant.get(participant, 0.5)), 1e-3))
+            elif role == "eeg":
+                weights.append(max(float(eeg_quality_by_participant.get(participant, 0.5)), 1e-3))
+            else:
+                weights.append(1.0)
+        total = sum(weights)
+        score = sum(
+            (weights[m] / total) * prob_alarm(probs_streams[m][i])
+            for m in range(len(probs_streams))
+        )
+        fused.append(score)
     return fused
+
+
+def fuse_uniform_avg(probs_a: list, probs_b: list, **kwargs) -> list[float]:
+    return fuse_uniform_avg_multi([probs_a, probs_b], **kwargs)
+
+
+def fuse_val_f1_weighted(probs_a: list, probs_b: list, **kwargs) -> list[float]:
+    return fuse_val_f1_weighted_multi(
+        [probs_a, probs_b],
+        val_probs_streams=[kwargs["val_probs_a"], kwargs["val_probs_b"]],
+        val_labels=kwargs["val_labels"],
+    )
+
+
+def fuse_majority_or(probs_a: list, probs_b: list, **kwargs) -> list[float]:
+    return fuse_majority_or_multi([probs_a, probs_b], **kwargs)
+
+
+def fuse_stacking_lr(probs_a: list, probs_b: list, **kwargs) -> list[float]:
+    return fuse_stacking_lr_multi(
+        [probs_a, probs_b],
+        val_probs_streams=[kwargs["val_probs_a"], kwargs["val_probs_b"]],
+        val_labels=kwargs["val_labels"],
+    )
+
+
+def fuse_quality_weighted(probs_a: list, probs_b: list, **kwargs) -> list[float]:
+    return fuse_quality_weighted_multi(
+        [probs_a, probs_b],
+        window_keys=kwargs["window_keys"],
+        speech_overlap_index=kwargs["speech_overlap_index"],
+        modality_quality_roles=["audio", "e4"],
+        e4_quality_by_participant=kwargs["bio_quality_by_participant"],
+        eeg_quality_by_participant={},
+        window_size_sec=kwargs.get("window_size_sec", 5.0),
+    )
 
 
 FUSION_FNS: dict[str, Callable] = {
@@ -244,6 +300,15 @@ def infer_classification_probs(
     return labels, probs
 
 
+MULTI_FUSION_FNS: dict[str, Callable] = {
+    "uniform_avg": fuse_uniform_avg_multi,
+    "val_f1_weighted": fuse_val_f1_weighted_multi,
+    "majority_or": fuse_majority_or_multi,
+    "stacking_lr": fuse_stacking_lr_multi,
+    "quality_weighted": fuse_quality_weighted_multi,
+}
+
+
 def run_late_fusion(
     cfg,
     *,
@@ -252,15 +317,38 @@ def run_late_fusion(
     methods: list[str] | None = None,
     repo_src: Path | None = None,
 ) -> dict[str, dict]:
-    """
-    Run decision-level late fusion for each method.
+    """Backward-compatible audio + bio (single biosignal tower) late fusion."""
+    return run_late_fusion_multimodal(
+        cfg,
+        classifier_specs=[
+            {"name": "audio", "run_dir": Path(audio_run_dir), "input_modality": "audio_only", "quality_role": "audio"},
+            {"name": "bio", "run_dir": Path(bio_run_dir), "input_modality": "bio_only", "quality_role": "e4"},
+        ],
+        methods=methods,
+        repo_src=repo_src,
+    )
 
-    Returns mapping method_name → {"fold_metrics": [...], "summary": {...}}.
+
+def run_late_fusion_multimodal(
+    cfg,
+    *,
+    classifier_specs: list[dict],
+    methods: list[str] | None = None,
+    repo_src: Path | None = None,
+) -> dict[str, dict]:
     """
+    Run decision-level late fusion for each method over N unimodal classifiers.
+
+    Each spec: {name, run_dir, input_modality, quality_role?}
+    quality_role: audio | e4 | eeg (for quality_weighted).
+    """
+    if len(classifier_specs) < 2:
+        raise ValueError("late fusion requires at least 2 classifier_specs")
+
     methods = list(methods or FUSION_METHODS)
-    unknown = [m for m in methods if m not in FUSION_FNS]
+    unknown = [m for m in methods if m not in MULTI_FUSION_FNS]
     if unknown:
-        raise ValueError(f"Unknown fusion methods: {unknown}. Allowed: {list(FUSION_FNS)}")
+        raise ValueError(f"Unknown fusion methods: {unknown}. Allowed: {list(MULTI_FUSION_FNS)}")
 
     repo_src = repo_src or Path(__file__).resolve().parents[1]
     train05 = _load_train_helpers(repo_src)
@@ -273,25 +361,28 @@ def run_late_fusion(
     samples = load_samples_with_seconds(windows_dir)
     participant_ids = get_all_participant_ids(samples)
 
-    audio_cfg = _clone_cfg_for_modality(cfg, "audio_only")
-    bio_cfg = _clone_cfg_for_modality(cfg, "bio_only")
-
-    audio_ckpt_dir = Path(audio_run_dir) / "checkpoints"
-    bio_ckpt_dir = Path(bio_run_dir) / "checkpoints"
-    _assert_checkpoints(audio_ckpt_dir, participant_ids, "audio")
-    _assert_checkpoints(bio_ckpt_dir, participant_ids, "bio")
+    modality_cfgs = []
+    ckpt_dirs = []
+    quality_roles = []
+    for spec in classifier_specs:
+        modality = str(spec["input_modality"])
+        modality_cfgs.append(_clone_cfg_for_modality(cfg, modality, spec.get("model_overrides")))
+        ckpt_dir = Path(spec["run_dir"]) / "checkpoints"
+        _assert_checkpoints(ckpt_dir, participant_ids, str(spec.get("name", modality)))
+        ckpt_dirs.append(ckpt_dir)
+        quality_roles.append(str(spec.get("quality_role", "e4")))
 
     if bool(cfg.training.get("cache_audio_embeddings", True)):
         shared_audio = AudioEncoder(
-            backend=audio_cfg.model.audio_encoder,
-            freeze_backbone=bool(audio_cfg.model.get("freeze_audio_backbone", True)),
+            backend=modality_cfgs[0].model.audio_encoder,
+            freeze_backbone=bool(modality_cfgs[0].model.get("freeze_audio_backbone", True)),
         ).to(device)
         train05.precompute_audio_embeddings(
             samples,
             shared_audio,
             device,
-            batch_size=int(audio_cfg.training.batch_size),
-            drop_waveforms=bool(audio_cfg.training.get("drop_waveform_after_embedding_cache", True)),
+            batch_size=int(cfg.training.batch_size),
+            drop_waveforms=bool(cfg.training.get("drop_waveform_after_embedding_cache", True)),
         )
     else:
         shared_audio = None
@@ -300,13 +391,19 @@ def run_late_fusion(
         Path(cfg.paths.data_processed) / "audio"
     )
     quality_dir = _resolve_quality_tables_dir(cfg)
-    bio_quality = load_participant_e4_quality_means(
+    e4_quality = load_participant_e4_quality_means(
         str(quality_dir),
         signals=list(cfg.data.e4_signals),
     )
+    eeg_quality = load_participant_neurosky_quality_means(
+        str(quality_dir),
+        signals=list(cfg.data.eeg_signals),
+    )
     window_size_sec = float(cfg.data.window_size_sec)
 
-    results_by_method: dict[str, dict] = {method: {"fold_metrics": [], "summary": {}} for method in methods}
+    results_by_method: dict[str, dict] = {
+        method: {"fold_metrics": [], "summary": {}} for method in methods
+    }
 
     for test_participant in participant_ids:
         train_samples, test_samples = build_loso_splits(samples, test_participant)
@@ -318,42 +415,53 @@ def run_late_fusion(
         val_samples = sort_samples(val_samples)
         test_samples = sort_samples(test_samples)
 
-        audio_model = _load_fold_model(
-            train05, audio_cfg, audio_ckpt_dir, test_participant, device, shared_audio,
-        )
-        bio_model = _load_fold_model(
-            train05, bio_cfg, bio_ckpt_dir, test_participant, device, shared_audio,
-        )
+        models = [
+            _load_fold_model(
+                train05, m_cfg, ckpt_dir, test_participant, device, shared_audio,
+            )
+            for m_cfg, ckpt_dir in zip(modality_cfgs, ckpt_dirs)
+        ]
 
         batch_size = int(cfg.training.batch_size)
-        val_labels, val_probs_a = infer_classification_probs(
-            audio_model, val_samples, audio_cfg, device, batch_size,
-        )
-        _, val_probs_b = infer_classification_probs(
-            bio_model, val_samples, bio_cfg, device, batch_size,
-        )
-        test_labels_a, test_probs_a = infer_classification_probs(
-            audio_model, test_samples, audio_cfg, device, batch_size,
-        )
-        test_labels_b, test_probs_b = infer_classification_probs(
-            bio_model, test_samples, bio_cfg, device, batch_size,
-        )
-        if test_labels_a != test_labels_b:
-            raise RuntimeError(f"Fold {test_participant}: audio/bio test labels differ.")
-        test_labels = test_labels_a
+        val_labels: list[int] | None = None
+        val_probs_streams: list[list] = []
+        test_probs_streams: list[list] = []
+        test_labels_ref: list[int] | None = None
+
+        for model, m_cfg in zip(models, modality_cfgs):
+            labels_val, probs_val = infer_classification_probs(
+                model, val_samples, m_cfg, device, batch_size,
+            )
+            labels_test, probs_test = infer_classification_probs(
+                model, test_samples, m_cfg, device, batch_size,
+            )
+            if val_labels is None:
+                val_labels = labels_val
+            elif val_labels != labels_val:
+                raise RuntimeError(f"Fold {test_participant}: val labels differ across modalities.")
+            if test_labels_ref is None:
+                test_labels_ref = labels_test
+            elif test_labels_ref != labels_test:
+                raise RuntimeError(f"Fold {test_participant}: test labels differ across modalities.")
+            val_probs_streams.append(probs_val)
+            test_probs_streams.append(probs_test)
+
+        assert val_labels is not None and test_labels_ref is not None
+        test_labels = test_labels_ref
 
         common_kwargs = {
             "val_labels": val_labels,
-            "val_probs_a": val_probs_a,
-            "val_probs_b": val_probs_b,
+            "val_probs_streams": val_probs_streams,
             "window_keys": sample_window_keys(test_samples),
             "speech_overlap_index": speech_overlap_index,
-            "bio_quality_by_participant": bio_quality,
+            "modality_quality_roles": quality_roles,
+            "e4_quality_by_participant": e4_quality,
+            "eeg_quality_by_participant": eeg_quality,
             "window_size_sec": window_size_sec,
         }
 
         for method in methods:
-            alarm_scores = FUSION_FNS[method](test_probs_a, test_probs_b, **common_kwargs)
+            alarm_scores = MULTI_FUSION_FNS[method](test_probs_streams, **common_kwargs)
             pred_labels = labels_from_alarm_scores(alarm_scores)
             pred_probs = probs_from_alarm_scores(alarm_scores)
             fold = {
@@ -370,7 +478,7 @@ def run_late_fusion(
             }
             results_by_method[method]["fold_metrics"].append(fold)
 
-        del audio_model, bio_model
+        del models
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
@@ -404,7 +512,7 @@ def save_late_fusion_results(
     return results_path
 
 
-def _clone_cfg_for_modality(cfg, input_modality: str):
+def _clone_cfg_for_modality(cfg, input_modality: str, model_overrides: dict | None = None):
     cloned = cfg.copy() if hasattr(cfg, "copy") else cfg
     from omegaconf import OmegaConf
 
@@ -412,6 +520,9 @@ def _clone_cfg_for_modality(cfg, input_modality: str):
     cloned.model.input_modality = input_modality
     cloned.model.fusion_mode = "cross_attn_pooled"
     cloned.task.mode = "classification"
+    if model_overrides:
+        for key, value in model_overrides.items():
+            cloned.model[key] = value
     return cloned
 
 

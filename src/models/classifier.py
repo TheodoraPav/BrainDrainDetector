@@ -37,7 +37,9 @@ from .temporal import build_inter_window_temporal, temporal_output_dim
 DEFAULT_FUSION_MODE = "cross_attn_pooled"
 DEFAULT_TASK_MODE   = "classification"
 DEFAULT_INPUT_MODALITY = "full"
-VALID_INPUT_MODALITIES = frozenset({"full", "audio_only", "bio_only"})
+VALID_INPUT_MODALITIES = frozenset({
+    "full", "audio_only", "bio_only", "e4_only", "eeg_only",
+})
 
 
 class BrainDrainDetector(nn.Module):
@@ -70,6 +72,7 @@ class BrainDrainDetector(nn.Module):
 
         e4_signals  = cfg.get("e4_signals",  ["EDA", "HR", "IBI"])
         eeg_signals = cfg.get("eeg_signals", ["theta", "alpha", "beta"])
+        self._num_e4_signals = len(e4_signals)
 
         biosignal_returns_sequence = self.fusion_mode == "sequence_cross_attn"
 
@@ -129,11 +132,18 @@ class BrainDrainDetector(nn.Module):
         else:
             audio_emb = self.audio_encoder(waveform)
 
+        if self.input_modality in ("e4_only", "eeg_only"):
+            biosignals = biosignals.clone()
+            if self.input_modality == "e4_only":
+                biosignals[..., self._num_e4_signals :] = 0
+            else:
+                biosignals[..., : self._num_e4_signals] = 0
+
         biosignal_output = self.biosignal_encoder(biosignals)
 
         if self.input_modality == "audio_only":
             biosignal_output = torch.zeros_like(biosignal_output)
-        elif self.input_modality == "bio_only":
+        elif self.input_modality in ("bio_only", "e4_only", "eeg_only"):
             audio_emb = torch.zeros_like(audio_emb)
 
         return self.fusion(audio_emb, biosignal_output)
