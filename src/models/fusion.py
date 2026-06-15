@@ -1,22 +1,16 @@
 """
 Fusion layers for BrainDrainDetector.
 
-Two fusion modes are available, selected by `configs/base.yaml -> model.fusion_mode`.
+Fusion modes are selected by `configs/base.yaml -> model.fusion_mode`.
 
 1) CrossAttentionFusion        (`fusion_mode: cross_attn_pooled`, default)
-       Audio (1 token) attends over biosignal (1 pooled token).
-       Lightweight, baseline. Sequence length on both sides is 1.
-
 2) SequenceCrossAttentionFusion (`fusion_mode: sequence_cross_attn`)
-       Audio (1 token) is the query.
-       The biosignal BiGRU output sequence (T tokens) is key and value.
-       Attention now produces real weights over time, so the model can decide
-       which biosignal time steps matter most given the audio context.
-       Note: this answers "where to look inside the biosignals", not
-       "audio vs biosignals" as a scalar gate.
+3) ConcatFusion                 (`fusion_mode: concat_fusion`)
+       Project audio and biosignal embeddings to half of project_dim each,
+       then concatenate. Intermediate fusion baseline (not decision-level late fusion).
 
-Both modules expose `last_attention_weights` after each forward pass for
-explainability use in `src/07_explain.py`.
+Attention-based modules expose `last_attention_weights` after each forward pass
+for explainability in `src/07_explain.py`.
 """
 
 import torch
@@ -176,8 +170,8 @@ class SequenceCrossAttentionFusion(nn.Module):
         return fused
 
 
-class LateFusion(nn.Module):
-    """Concatenation-based late fusion of audio and biosignals (baseline)."""
+class ConcatFusion(nn.Module):
+    """Intermediate fusion: project audio and biosignals, then concatenate (baseline)."""
 
     def __init__(
         self,
@@ -193,7 +187,7 @@ class LateFusion(nn.Module):
         self.layer_norm = nn.LayerNorm(project_dim)
         self.dropout = nn.Dropout(dropout)
         
-        # Late fusion doesn't use attention, so weights are None
+        # Concat fusion does not use attention; weights are None.
         self.last_attention_weights = None
 
     def forward(
@@ -214,6 +208,12 @@ class LateFusion(nn.Module):
         return fused
 
 
+_FUSION_MODE_ALIASES = {
+    # Deprecated: was misnamed; this is intermediate concat fusion, not decision-level late fusion.
+    "late_fusion": "concat_fusion",
+}
+
+
 def build_fusion_layer(
     fusion_mode: str,
     audio_dim: int,
@@ -228,8 +228,11 @@ def build_fusion_layer(
     Allowed values:
       - "cross_attn_pooled"   -> CrossAttentionFusion         (default)
       - "sequence_cross_attn" -> SequenceCrossAttentionFusion (extra option)
-      - "late_fusion"         -> LateFusion                   (concatenation-based baseline)
+      - "concat_fusion"       -> ConcatFusion                 (intermediate concat baseline)
     """
+    if fusion_mode in _FUSION_MODE_ALIASES:
+        fusion_mode = _FUSION_MODE_ALIASES[fusion_mode]
+
     if fusion_mode == "cross_attn_pooled":
         return CrossAttentionFusion(
             audio_dim=audio_dim,
@@ -248,8 +251,8 @@ def build_fusion_layer(
             dropout=dropout,
         )
 
-    if fusion_mode == "late_fusion":
-        return LateFusion(
+    if fusion_mode == "concat_fusion":
+        return ConcatFusion(
             audio_dim=audio_dim,
             biosignal_dim=biosignal_dim,
             project_dim=project_dim,
@@ -258,5 +261,5 @@ def build_fusion_layer(
 
     raise ValueError(
         f"Unknown fusion_mode: {fusion_mode!r}. "
-        f"Allowed values: 'cross_attn_pooled', 'sequence_cross_attn', 'late_fusion'."
+        f"Allowed values: 'cross_attn_pooled', 'sequence_cross_attn', 'concat_fusion'."
     )

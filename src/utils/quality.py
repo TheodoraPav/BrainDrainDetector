@@ -69,6 +69,33 @@ def is_e4_quality_perfect(
     return True
 
 
+def load_participant_e4_quality_means(
+    data_quality_dir: str,
+    signals: list | None = None,
+) -> Dict[str, float]:
+    """
+    Mean E4 completeness per participant (P1, P2, ...) for selected signals.
+
+    Returns values in [0, 1]. Missing signals are skipped; if none remain, 0.5.
+    """
+    import numpy as np
+
+    signal_list = list(signals or ["EDA", "HR", "IBI"])
+    df = load_e4_quality(data_quality_dir)
+    scores: Dict[str, float] = {}
+    for idx in range(len(df)):
+        participant = f"P{idx + 1}"
+        row = df.iloc[idx]
+        values: list[float] = []
+        for signal in signal_list:
+            raw = row.get(signal)
+            if raw is None or str(raw).strip().lower() == "n/a":
+                continue
+            values.append(float(raw))
+        scores[participant] = float(np.mean(values)) if values else 0.5
+    return scores
+
+
 def build_quality_map(data_quality_dir: str, signals: list = None) -> Dict[int, bool]:
     """
     Builds a dict mapping participant_idx (0-based) → bool (True = perfect quality).

@@ -38,7 +38,7 @@ KAGGLE_DATASET_SLUG = "braindraindataset"
 
 # Baseline experiment knobs (keep as-is for simplest classification run)
 TASK_MODE = "classification"        # "classification" | "regression_va"
-FUSION_MODE = "late_fusion"   # "cross_attn_pooled" | "sequence_cross_attn" | "late_fusion"
+FUSION_MODE = "concat_fusion"   # "cross_attn_pooled" | "sequence_cross_attn" | "concat_fusion"
 AUGMENTATION_ENABLED = False        # no augmentation
 
 # 1D CNN before BiGRU on physio (~50 steps inside each 5 s window).
