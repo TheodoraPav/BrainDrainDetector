@@ -1,0 +1,25 @@
+# ============================================================
+# GMU fusion — weighted loss, macro-F1 selection, no augmentation
+# Fair comparison vs cross_attn_pooled_weighted_no_aug
+# ============================================================
+defaults:
+  - base
+
+model:
+  fusion_mode: gated_multimodal_unit
+  input_modality: full
+  dual_tower_biosignal: false
+  gmu:
+    gate_reg_enabled: true
+    gate_reg_lambda: 0.01
+    audio_bias_init: 0.67
+    use_quality_inputs: false
+
+training:
+  weighted_loss: true
+  balanced_sampling: true
+  selection_metric: macro_f1
+  batch_size: 8
+
+augmentation:
+  enabled: false
