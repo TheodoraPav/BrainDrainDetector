@@ -14,7 +14,7 @@ Single encoder (default):
 
 Dual-tower encoder (model.dual_tower_biosignal: true):
   E4 channels -> BiGRU(hidden_size // 2)  \
-  EEG channels -> BiGRU(hidden_size // 2)  / -> concat -> same output dim as single encoder.
+  EEG channels -> BiGRU(hidden_size // 2)  / -> concat OR (e4_emb, eeg_emb) when split_tower_outputs.
 
 Input shape : (batch, time_steps, num_signals)
 """
@@ -135,10 +135,14 @@ class BiosignalEncoder(nn.Module):
 
 class DualTowerBiosignalEncoder(nn.Module):
     """
-    Separate BiGRU encoders for E4 and EEG, then concatenate outputs.
+    Separate BiGRU encoders for E4 and EEG.
 
     Each tower uses hidden_size = biosignal_hidden_size // 2 so the final
-    embedding dim matches the single BiGRU encoder (biosignal_hidden_size * 2).
+    embedding dim matches the single BiGRU encoder (biosignal_hidden_size * 2)
+    when outputs are concatenated.
+
+    With split_tower_outputs=True, forward returns (e4_emb, eeg_emb) for
+    hierarchical intra-bio fusion instead of concat.
     """
 
     def __init__(
@@ -149,10 +153,14 @@ class DualTowerBiosignalEncoder(nn.Module):
         num_layers: int,
         return_sequence: bool = False,
         physio_cnn: dict | None = None,
+        *,
+        split_tower_outputs: bool = False,
     ):
         super().__init__()
         self.return_sequence = return_sequence
+        self.split_tower_outputs = bool(split_tower_outputs)
         self.num_e4_signals = num_e4_signals
+        self.tower_output_dim = max(1, hidden_size // 2) * 2
 
         tower_hidden = max(1, hidden_size // 2)
         self.e4_tower = _BiGRUTower(
@@ -169,16 +177,24 @@ class DualTowerBiosignalEncoder(nn.Module):
             return_sequence=return_sequence,
             physio_cnn=physio_cnn,
         )
-        self.embedding_dim = self.e4_tower.output_dim + self.eeg_tower.output_dim
+        self.embedding_dim = (
+            self.tower_output_dim
+            if self.split_tower_outputs
+            else self.e4_tower.output_dim + self.eeg_tower.output_dim
+        )
 
     def uses_physio_cnn(self) -> bool:
         return self.e4_tower.uses_physio_cnn() or self.eeg_tower.uses_physio_cnn()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         e4 = x[..., : self.num_e4_signals]
         eeg = x[..., self.num_e4_signals :]
         e4_out = self.e4_tower(e4)
         eeg_out = self.eeg_tower(eeg)
+        if self.split_tower_outputs:
+            return e4_out, eeg_out
         return torch.cat([e4_out, eeg_out], dim=-1)
 
 
@@ -191,6 +207,7 @@ def build_biosignal_encoder(
     num_layers: int,
     return_sequence: bool,
     physio_cnn: dict | None = None,
+    split_tower_outputs: bool = False,
 ) -> nn.Module:
     if dual_tower:
         return DualTowerBiosignalEncoder(
@@ -200,6 +217,7 @@ def build_biosignal_encoder(
             num_layers=num_layers,
             return_sequence=return_sequence,
             physio_cnn=physio_cnn,
+            split_tower_outputs=split_tower_outputs,
         )
 
     return BiosignalEncoder(

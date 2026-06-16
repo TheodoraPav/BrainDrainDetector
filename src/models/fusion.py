@@ -292,6 +292,29 @@ _FUSION_MODE_ALIASES = {
 }
 
 
+def build_bio_intra_fusion_layer(
+    tower_dim: int,
+    project_dim: int,
+    num_heads: int,
+    dropout: float,
+) -> CrossAttentionFusion:
+    """
+    Intra-bio cross-attention for dual-tower encoders.
+
+    E4 embedding is the query; EEG is key/value. Uses the standard (legacy)
+    residual on the query path — same as audio↔bio cross-attn without
+    balanced_residual.
+    """
+    return CrossAttentionFusion(
+        audio_dim=tower_dim,
+        biosignal_dim=tower_dim,
+        project_dim=project_dim,
+        num_heads=num_heads,
+        dropout=dropout,
+        balanced_residual=False,
+    )
+
+
 def build_fusion_layer(
     fusion_mode: str,
     audio_dim: int,

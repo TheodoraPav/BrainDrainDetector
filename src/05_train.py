@@ -149,6 +149,7 @@ def _temporal_signature(cfg) -> dict:
     pc_on = bool(pc.get("enabled", False))
     cross_attn = dict(cfg.model.get("cross_attn", {}) or {})
     mod_drop = dict(cfg.model.get("modality_dropout", {}) or {})
+    dual_tower = dict(cfg.model.get("dual_tower", {}) or {})
     sig = {
         "enabled": enabled,
         "type": str(t.get("type", "none")).lower() if enabled else "none",
@@ -156,6 +157,11 @@ def _temporal_signature(cfg) -> dict:
         "hidden_size": int(t.get("hidden_size", 128)) if enabled else 0,
         "bidirectional": bool(t.get("bidirectional", False)) if enabled else False,
         "physio_cnn_enabled": pc_on,
+        "dual_tower_biosignal": bool(cfg.model.get("dual_tower_biosignal", False)),
+        "dual_tower_intra_bio_fusion": str(
+            dual_tower.get("intra_bio_fusion", "concat")
+        ).lower(),
+        "dual_tower_intra_bio_num_heads": int(dual_tower.get("intra_bio_num_heads", 2)),
         "cross_attn_balanced_residual": bool(cross_attn.get("balanced_residual", False)),
         "modality_dropout_enabled": bool(mod_drop.get("enabled", False)),
         "modality_dropout_p": float(mod_drop.get("p", 0.15)),

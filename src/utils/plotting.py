@@ -497,6 +497,46 @@ def plot_attention_map(
     return str(save_path)
 
 
+def plot_gmu_gate(
+    gate_z: np.ndarray,
+    figures_dir: str,
+    filename: str = "gmu_gate.png",
+    title: str = "GMU gate (audio weight per feature)",
+) -> str:
+    """
+    Visualize GMU gate z.
+
+    gate_z: (batch, project_dim) or (project_dim,) — values in [0, 1] (audio weight).
+    """
+    if gate_z.ndim == 1:
+        mean_z = gate_z
+        scalar_audio_weight = float(np.mean(gate_z))
+    else:
+        mean_z = gate_z.mean(axis=0)
+        scalar_audio_weight = float(gate_z.mean())
+
+    fig, (ax_hist, ax_bar) = plt.subplots(1, 2, figsize=(10, 3.5))
+    ax_hist.hist(mean_z, bins=30, color="#4C72B0", edgecolor="white")
+    ax_hist.set_xlabel("Gate z (audio weight)")
+    ax_hist.set_ylabel("Count (feature dims)")
+    ax_hist.set_title("Distribution over fused dimensions")
+    ax_hist.axvline(scalar_audio_weight, color="#e63946", linestyle="--", label=f"mean={scalar_audio_weight:.3f}")
+    ax_hist.legend()
+
+    ax_bar.bar(["Audio weight", "Biosignal weight"], [scalar_audio_weight, 1.0 - scalar_audio_weight],
+               color=["#4C72B0", "#DD8452"])
+    ax_bar.set_ylim(0, 1)
+    ax_bar.set_ylabel("Mean gate value")
+    ax_bar.set_title("Scalar modality balance (batch mean)")
+
+    fig.suptitle(title)
+    plt.tight_layout()
+    save_path = _ensure_figures_dir(figures_dir) / filename
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
+    return str(save_path)
+
+
 def plot_attention_over_time(
     attention_weights: np.ndarray,
     figures_dir: str,

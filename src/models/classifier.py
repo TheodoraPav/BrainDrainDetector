@@ -30,7 +30,7 @@ import torch.nn as nn
 
 from .audio_encoder import AudioEncoder
 from .biosignal_encoder import build_biosignal_encoder
-from .fusion import build_fusion_layer
+from .fusion import build_bio_intra_fusion_layer, build_fusion_layer
 from .temporal import build_inter_window_temporal, temporal_output_dim
 
 
@@ -74,19 +74,49 @@ class BrainDrainDetector(nn.Module):
         eeg_signals = cfg.get("eeg_signals", ["theta", "alpha", "beta"])
         self._num_e4_signals = len(e4_signals)
 
+        dual_tower_cfg = dict(cfg.get("dual_tower", {}) or {})
+        self._dual_tower = bool(cfg.get("dual_tower_biosignal", False))
+        self._intra_bio_fusion = str(
+            dual_tower_cfg.get("intra_bio_fusion", "concat")
+        ).lower()
+        self._use_intra_bio_attn = (
+            self._dual_tower and self._intra_bio_fusion == "cross_attn"
+        )
+
         biosignal_returns_sequence = self.fusion_mode == "sequence_cross_attn"
+        if self._use_intra_bio_attn and biosignal_returns_sequence:
+            raise ValueError(
+                "dual_tower.intra_bio_fusion=cross_attn requires fusion_mode "
+                "cross_attn_pooled (not sequence_cross_attn)."
+            )
 
         self.biosignal_encoder = build_biosignal_encoder(
-            dual_tower=bool(cfg.get("dual_tower_biosignal", False)),
+            dual_tower=self._dual_tower,
             num_e4_signals=len(e4_signals),
             num_eeg_signals=len(eeg_signals),
             hidden_size=cfg["biosignal_hidden_size"],
             num_layers=cfg["biosignal_num_layers"],
             return_sequence=biosignal_returns_sequence,
             physio_cnn=cfg.get("physio_cnn", {}),
+            split_tower_outputs=self._use_intra_bio_attn,
         )
 
         project_dim = cfg["biosignal_hidden_size"] * 2
+        if self._use_intra_bio_attn:
+            tower_dim = getattr(
+                self.biosignal_encoder, "tower_output_dim", project_dim // 2
+            )
+            intra_heads = int(dual_tower_cfg.get("intra_bio_num_heads", 2))
+            self.bio_intra_fusion = build_bio_intra_fusion_layer(
+                tower_dim=tower_dim,
+                project_dim=project_dim,
+                num_heads=intra_heads,
+                dropout=cfg["fusion_dropout"],
+            )
+            fusion_biosignal_dim = project_dim
+        else:
+            self.bio_intra_fusion = None
+            fusion_biosignal_dim = self.biosignal_encoder.embedding_dim
 
         mod_drop = dict(cfg.get("modality_dropout", {}) or {})
         self._modality_dropout_enabled = bool(mod_drop.get("enabled", False))
@@ -95,7 +125,7 @@ class BrainDrainDetector(nn.Module):
         self.fusion = build_fusion_layer(
             fusion_mode=self.fusion_mode,
             audio_dim=self.audio_encoder.embedding_dim,
-            biosignal_dim=self.biosignal_encoder.embedding_dim,
+            biosignal_dim=fusion_biosignal_dim,
             project_dim=project_dim,
             num_heads=cfg["fusion_num_heads"],
             dropout=cfg["fusion_dropout"],
@@ -148,14 +178,41 @@ class BrainDrainDetector(nn.Module):
         biosignal_output = self.biosignal_encoder(biosignals)
 
         if self.input_modality == "audio_only":
-            biosignal_output = torch.zeros_like(biosignal_output)
+            biosignal_output = self._zero_biosignal_output(biosignal_output)
         elif self.input_modality in ("bio_only", "e4_only", "eeg_only"):
             audio_emb = torch.zeros_like(audio_emb)
 
-        if self.training and self._modality_dropout_enabled and self.input_modality == "full":
-            audio_emb, biosignal_output = self._apply_modality_dropout(audio_emb, biosignal_output)
+        fused_bio = self._fuse_biosignals(biosignal_output)
 
-        return self.fusion(audio_emb, biosignal_output)
+        if self.training and self._modality_dropout_enabled and self.input_modality == "full":
+            audio_emb, fused_bio = self._apply_modality_dropout(audio_emb, fused_bio)
+
+        return self.fusion(audio_emb, fused_bio)
+
+    def _zero_biosignal_output(
+        self, biosignal_output: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if isinstance(biosignal_output, tuple):
+            return (
+                torch.zeros_like(biosignal_output[0]),
+                torch.zeros_like(biosignal_output[1]),
+            )
+        return torch.zeros_like(biosignal_output)
+
+    def _fuse_biosignals(
+        self, biosignal_output: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+    ) -> torch.Tensor:
+        if not self._use_intra_bio_attn:
+            assert isinstance(biosignal_output, torch.Tensor)
+            return biosignal_output
+
+        e4_emb, eeg_emb = biosignal_output
+        if self.input_modality == "e4_only":
+            eeg_emb = torch.zeros_like(eeg_emb)
+        elif self.input_modality == "eeg_only":
+            e4_emb = torch.zeros_like(e4_emb)
+
+        return self.bio_intra_fusion(e4_emb, eeg_emb)
 
     def _apply_modality_dropout(
         self,

@@ -1,9 +1,8 @@
 """
-Step 7 — Explainability: attention map visualization.
+Step 7 — Explainability: attention map / GMU gate visualization.
 
-For each LOSO fold, loads the best checkpoint and reads the attention weights
-that the fusion layer stored during a forward pass. The visualization adapts
-to the active `model.fusion_mode`:
+For each LOSO fold, loads the best checkpoint and reads fusion-layer artifacts
+from a forward pass. The visualization adapts to the active `model.fusion_mode`:
 
   - cross_attn_pooled
         Fusion weights are (num_heads, 1, 1). Saved as a small heatmap per head
@@ -15,7 +14,10 @@ to the active `model.fusion_mode`:
         `plot_attention_over_time`, showing which time steps the audio query
         focuses on.
 
-Figures land in `figures/attention_maps/`.
+  - gated_multimodal_unit
+        Per-feature gate z in [0, 1]^D (audio weight). Saved via `plot_gmu_gate`.
+
+Figures land in `figures/attention_maps/` (GMU gates use the same folder).
 
 Usage:
     python src/07_explain.py --config configs/exp_baseline.yaml
@@ -38,7 +40,7 @@ from data.dataset import (
     get_all_participant_ids,
     make_brain_drain_dataset,
 )
-from utils.plotting import plot_attention_map, plot_attention_over_time
+from utils.plotting import plot_attention_map, plot_attention_over_time, plot_gmu_gate
 
 
 def extract_attention_weights(
@@ -73,10 +75,31 @@ def extract_attention_weights(
             "`self.last_attention_weights`."
         )
 
-    # weights: (batch, num_heads, query_len, key_len)
-    # Average over the batch dimension to get a single, smooth heatmap per head.
-    weights = weights.mean(dim=0)  # (num_heads, query_len, key_len)
+    weights = weights.mean(dim=0)
     return weights.cpu().numpy()
+
+
+def extract_gmu_gate(
+    model: BrainDrainDetector,
+    batch: tuple,
+    device: torch.device,
+) -> np.ndarray:
+    """Returns gate z averaged over batch: (project_dim,)."""
+    waveform, biosignals, _ = batch
+    if waveform.dim() == 3:
+        waveform = waveform[:, -1, :]
+        biosignals = biosignals[:, -1, :, :]
+    waveform = waveform.to(device)
+    biosignals = biosignals.to(device)
+
+    model.eval()
+    with torch.no_grad():
+        model(waveform, biosignals)
+
+    gate_z = getattr(model.fusion, "last_gate_z", None)
+    if gate_z is None:
+        raise RuntimeError("GMU fusion did not store last_gate_z after forward pass.")
+    return gate_z.detach().cpu().numpy()
 
 
 def save_attention_figure(
@@ -85,10 +108,7 @@ def save_attention_figure(
     figures_dir: str,
     participant: str,
 ) -> str:
-    """
-    Routes the saved figure to the correct plotter based on the fusion mode.
-    Returns the saved file path.
-    """
+    """Routes the saved figure to the correct plotter based on the fusion mode."""
     if fusion_mode == "cross_attn_pooled":
         return plot_attention_map(
             attention_weights,
@@ -98,8 +118,7 @@ def save_attention_figure(
         )
 
     if fusion_mode == "sequence_cross_attn":
-        # attention_weights: (num_heads, 1, T) -> drop the query-len dim.
-        weights_over_time = attention_weights[:, 0, :]  # (num_heads, T)
+        weights_over_time = attention_weights[:, 0, :]
         return plot_attention_over_time(
             weights_over_time,
             figures_dir=figures_dir,
@@ -108,7 +127,7 @@ def save_attention_figure(
             time_axis_label="Biosignal time step (within window)",
         )
 
-    raise ValueError(f"Unknown fusion_mode: {fusion_mode!r}")
+    raise ValueError(f"Unknown fusion_mode for attention plots: {fusion_mode!r}")
 
 
 def main(cfg):
@@ -125,7 +144,9 @@ def main(cfg):
     if fusion_mode in ("concat_fusion", "late_fusion"):
         print("Concat fusion does not use attention weights. Skipping explainability plots.")
         return
-    print(f"Generating attention maps for {len(participant_ids)} LOSO folds.")
+
+    label = "gate maps" if fusion_mode == "gated_multimodal_unit" else "attention maps"
+    print(f"Generating {label} for {len(participant_ids)} LOSO folds.")
     print(f"Active fusion_mode: {fusion_mode}")
 
     for test_participant in participant_ids:
@@ -143,24 +164,32 @@ def main(cfg):
             labels_cfg=cfg.labels,
             temporal_cfg=temporal_cfg,
         )
-        test_loader     = DataLoader(test_dataset, batch_size=8, shuffle=False, num_workers=0)
+        test_loader = DataLoader(test_dataset, batch_size=8, shuffle=False, num_workers=0)
 
         model = BrainDrainDetector(dict(cfg.model)).to(device)
         model.load_state_dict(torch.load(ckpt_path, weights_only=True, map_location=device), strict=False)
 
-        # Use the first batch for visualization.
-        first_batch       = next(iter(test_loader))
-        attention_weights = extract_attention_weights(model, first_batch, device)
+        first_batch = next(iter(test_loader))
 
-        save_path = save_attention_figure(
-            fusion_mode=fusion_mode,
-            attention_weights=attention_weights,
-            figures_dir=figures_dir,
-            participant=test_participant,
-        )
-        print(f"  {test_participant}: attention figure saved -> {save_path}")
+        if fusion_mode == "gated_multimodal_unit":
+            gate_z = extract_gmu_gate(model, first_batch, device)
+            save_path = plot_gmu_gate(
+                gate_z,
+                figures_dir=figures_dir,
+                filename=f"gmu_gate_{test_participant}.png",
+                title=f"GMU Gate — Fold {test_participant}",
+            )
+        else:
+            attention_weights = extract_attention_weights(model, first_batch, device)
+            save_path = save_attention_figure(
+                fusion_mode=fusion_mode,
+                attention_weights=attention_weights,
+                figures_dir=figures_dir,
+                participant=test_participant,
+            )
+        print(f"  {test_participant}: figure saved -> {save_path}")
 
-    print("\nAttention map generation complete.")
+    print(f"\n{label.capitalize()} generation complete.")
 
 
 if __name__ == "__main__":

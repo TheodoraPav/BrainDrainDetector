@@ -3,6 +3,7 @@ from .biosignal_encoder import BiosignalEncoder, DualTowerBiosignalEncoder, buil
 from .fusion import (
     ConcatFusion,
     CrossAttentionFusion,
+    GatedMultimodalFusion,
     SequenceCrossAttentionFusion,
     build_fusion_layer,
 )
@@ -15,6 +16,7 @@ __all__ = [
     "build_biosignal_encoder",
     "ConcatFusion",
     "CrossAttentionFusion",
+    "GatedMultimodalFusion",
     "SequenceCrossAttentionFusion",
     "build_fusion_layer",
     "BrainDrainDetector",
