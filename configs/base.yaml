@@ -82,10 +82,28 @@ model:
   # Used by classification only (always 2: Safe / Alarm).
   num_classes: 2
   # Fusion layer selection.
-  #   cross_attn_pooled   -> baseline cross-attention with a pooled biosignal token (default)
-  #   sequence_cross_attn -> audio query attends over the BiGRU output sequence (extra option)
-  #   concat_fusion       -> intermediate concat of projected audio + biosignal embeddings
+  #   cross_attn_pooled        -> baseline cross-attention with a pooled biosignal token (default)
+  #   sequence_cross_attn      -> audio query attends over the BiGRU output sequence (extra option)
+  #   concat_fusion            -> intermediate concat of projected audio + biosignal embeddings
+  #   gated_multimodal_unit    -> GMU: per-feature gate between audio and biosignal (2 modalities)
   fusion_mode: "cross_attn_pooled"
+
+  # Cross-attention options (fusion_mode cross_attn_pooled | sequence_cross_attn)
+  cross_attn:
+    # true → learnable residuals from audio AND biosignal (reduces audio-only skip path)
+    balanced_residual: false
+
+  # Per-sample modality dropout before fusion (train only, input_modality=full)
+  modality_dropout:
+    enabled: false
+    p: 0.15
+
+  # GMU settings (used when fusion_mode = gated_multimodal_unit)
+  gmu:
+    gate_reg_enabled: true      # L_total = L_CE + lambda * L_gate (anti modality collapse)
+    gate_reg_lambda: 0.01
+    audio_bias_init: 0.67       # initial sigmoid bias → slightly favor pretrained audio
+    use_quality_inputs: false   # ablation only (not wired yet)
 
   # Single-modality ablation (zeros the other branch after encoding, before fusion).
   #   full        — both modalities (default)

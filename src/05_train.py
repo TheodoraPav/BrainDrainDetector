@@ -147,6 +147,8 @@ def _temporal_signature(cfg) -> dict:
     enabled = _temporal_enabled(cfg)
     pc = _physio_cnn_cfg(cfg)
     pc_on = bool(pc.get("enabled", False))
+    cross_attn = dict(cfg.model.get("cross_attn", {}) or {})
+    mod_drop = dict(cfg.model.get("modality_dropout", {}) or {})
     sig = {
         "enabled": enabled,
         "type": str(t.get("type", "none")).lower() if enabled else "none",
@@ -154,6 +156,9 @@ def _temporal_signature(cfg) -> dict:
         "hidden_size": int(t.get("hidden_size", 128)) if enabled else 0,
         "bidirectional": bool(t.get("bidirectional", False)) if enabled else False,
         "physio_cnn_enabled": pc_on,
+        "cross_attn_balanced_residual": bool(cross_attn.get("balanced_residual", False)),
+        "modality_dropout_enabled": bool(mod_drop.get("enabled", False)),
+        "modality_dropout_p": float(mod_drop.get("p", 0.15)),
     }
     if pc_on:
         sig["physio_cnn_out_channels"] = int(pc.get("out_channels", 32))
@@ -166,6 +171,8 @@ def _loso_meta_matches_cfg(cfg, data: dict) -> bool:
     if data.get("task_mode") != _task_mode(cfg):
         return False
     if data.get("input_modality", "full") != cfg.model.get("input_modality", "full"):
+        return False
+    if data.get("fusion_mode", "cross_attn_pooled") != cfg.model.get("fusion_mode", "cross_attn_pooled"):
         return False
     saved = data.get("temporal_signature")
     current = _temporal_signature(cfg)
@@ -186,6 +193,24 @@ def _build_model_cfg(cfg) -> dict:
 
 def _training_use_amp(cfg, device: torch.device) -> bool:
     return device.type == "cuda" and bool(cfg.training.get("use_amp", False))
+
+
+def _gmu_training_settings(cfg) -> dict:
+    """Gate regularization for fusion_mode=gated_multimodal_unit."""
+    fusion_mode = cfg.model.get("fusion_mode", "cross_attn_pooled")
+    gmu = dict(cfg.model.get("gmu", {}) or {})
+    enabled = fusion_mode == "gated_multimodal_unit" and bool(gmu.get("gate_reg_enabled", True))
+    return {
+        "enabled": enabled,
+        "lambda": float(gmu.get("gate_reg_lambda", 0.01)) if enabled else 0.0,
+    }
+
+
+def _gmu_gate_regularization(gate_z: torch.Tensor) -> torch.Tensor:
+    """Negative mean per-dimension binary entropy of batch-averaged gate (maximize entropy)."""
+    bar_z = gate_z.mean(dim=0).clamp(1e-6, 1.0 - 1e-6)
+    entropy = -(bar_z * bar_z.log() + (1.0 - bar_z) * (1.0 - bar_z).log())
+    return -entropy.mean()
 
 
 def _resolve_va_loss_settings(cfg) -> dict:
@@ -447,6 +472,7 @@ def run_one_epoch(
     task_mode: str = "classification",
     use_amp: bool = False,
     scaler: torch.amp.GradScaler | None = None,
+    gmu_gate_reg_lambda: float = 0.0,
 ):
     """
     Runs one training or validation epoch.
@@ -483,6 +509,11 @@ def run_one_epoch(
             else:
                 output = model(waveform, biosignals)
                 loss   = criterion(output, targets)
+
+            if is_training and gmu_gate_reg_lambda > 0.0:
+                gate_z = getattr(getattr(model, "fusion", None), "last_gate_z", None)
+                if gate_z is not None:
+                    loss = loss + gmu_gate_reg_lambda * _gmu_gate_regularization(gate_z)
 
             if is_training:
                 optimizer.zero_grad(set_to_none=True)
@@ -714,6 +745,9 @@ def train_one_fold(
     best_ckpt_path = checkpoints_dir / f"best_{test_participant}.pt"
     use_amp  = _training_use_amp(cfg, device)
     scaler   = torch.amp.GradScaler("cuda") if use_amp else None
+    gmu_train = _gmu_training_settings(cfg)
+    if gmu_train["enabled"]:
+        print(f"  GMU gate regularization: lambda={gmu_train['lambda']:.4f}")
     patience  = int(cfg.training.get("early_stopping_patience", 0))
     min_epochs = int(cfg.training.get("early_stopping_min_epochs", 1))
     epochs_without_improvement = 0
@@ -755,10 +789,12 @@ def train_one_fold(
         train_loss, _, _, _ = run_one_epoch(
             model, train_loader, criterion, optimizer, device,
             is_training=True, task_mode=task_mode, use_amp=use_amp, scaler=scaler,
+            gmu_gate_reg_lambda=gmu_train["lambda"],
         )
         val_loss, val_labels, val_preds, _ = run_one_epoch(
             model, val_loader, criterion, optimizer, device,
             is_training=False, task_mode=task_mode, use_amp=use_amp,
+            gmu_gate_reg_lambda=0.0,
         )
         epochs_run = epoch + 1
 

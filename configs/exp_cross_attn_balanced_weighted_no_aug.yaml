@@ -1,0 +1,25 @@
+# ============================================================
+# Balanced cross-attention — fixes audio-heavy residual path
+# Same fair training protocol as cross_attn_pooled_weighted_no_aug
+# ============================================================
+defaults:
+  - base
+
+model:
+  fusion_mode: cross_attn_pooled
+  input_modality: full
+  dual_tower_biosignal: false
+  cross_attn:
+    balanced_residual: true
+  modality_dropout:
+    enabled: true
+    p: 0.15
+
+training:
+  weighted_loss: true
+  balanced_sampling: true
+  selection_metric: macro_f1
+  batch_size: 8
+
+augmentation:
+  enabled: false

@@ -88,6 +88,10 @@ class BrainDrainDetector(nn.Module):
 
         project_dim = cfg["biosignal_hidden_size"] * 2
 
+        mod_drop = dict(cfg.get("modality_dropout", {}) or {})
+        self._modality_dropout_enabled = bool(mod_drop.get("enabled", False))
+        self._modality_dropout_p = float(mod_drop.get("p", 0.15))
+
         self.fusion = build_fusion_layer(
             fusion_mode=self.fusion_mode,
             audio_dim=self.audio_encoder.embedding_dim,
@@ -95,6 +99,8 @@ class BrainDrainDetector(nn.Module):
             project_dim=project_dim,
             num_heads=cfg["fusion_num_heads"],
             dropout=cfg["fusion_dropout"],
+            gmu_cfg=cfg.get("gmu", {}),
+            cross_attn_cfg=cfg.get("cross_attn", {}),
         )
 
         self.temporal_cfg = cfg.get("temporal", {}) or {}
@@ -146,7 +152,30 @@ class BrainDrainDetector(nn.Module):
         elif self.input_modality in ("bio_only", "e4_only", "eeg_only"):
             audio_emb = torch.zeros_like(audio_emb)
 
+        if self.training and self._modality_dropout_enabled and self.input_modality == "full":
+            audio_emb, biosignal_output = self._apply_modality_dropout(audio_emb, biosignal_output)
+
         return self.fusion(audio_emb, biosignal_output)
+
+    def _apply_modality_dropout(
+        self,
+        audio_emb: torch.Tensor,
+        biosignal_output: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-sample modality dropout — forces both branches to be usable (train only)."""
+        p = self._modality_dropout_p
+        batch_size = audio_emb.shape[0]
+        device = audio_emb.device
+        drop_audio = torch.rand(batch_size, device=device) < p
+        drop_bio = torch.rand(batch_size, device=device) < p
+        both_dropped = drop_audio & drop_bio
+        drop_audio = drop_audio & ~both_dropped
+        drop_bio = drop_bio & ~both_dropped
+        audio_mask = (~drop_audio).float().unsqueeze(-1)
+        bio_mask = (~drop_bio).float()
+        while bio_mask.dim() < biosignal_output.dim():
+            bio_mask = bio_mask.unsqueeze(-1)
+        return audio_emb * audio_mask, biosignal_output * bio_mask
 
     def _apply_temporal(self, fused_seq: torch.Tensor) -> torch.Tensor:
         """(batch, time, project_dim) -> (batch, head_dim) from last causal step."""
