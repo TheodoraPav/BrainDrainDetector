@@ -122,6 +122,9 @@ class BrainDrainDetector(nn.Module):
         self._modality_dropout_enabled = bool(mod_drop.get("enabled", False))
         self._modality_dropout_p = float(mod_drop.get("p", 0.15))
 
+        cross_attn_cfg = dict(cfg.get("cross_attn", {}) or {})
+        self._quality_aware = bool(cross_attn_cfg.get("quality_aware", False))
+
         self.fusion = build_fusion_layer(
             fusion_mode=self.fusion_mode,
             audio_dim=self.audio_encoder.embedding_dim,
@@ -157,7 +160,12 @@ class BrainDrainDetector(nn.Module):
     def uses_temporal(self) -> bool:
         return self.inter_window_temporal is not None
 
-    def _encode_fused(self, waveform: torch.Tensor, biosignals: torch.Tensor) -> torch.Tensor:
+    def _encode_fused(
+        self,
+        waveform: torch.Tensor,
+        biosignals: torch.Tensor,
+        quality: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Single-window fused embedding (batch, project_dim)."""
         if (
             waveform.dim() == 2
@@ -186,6 +194,17 @@ class BrainDrainDetector(nn.Module):
 
         if self.training and self._modality_dropout_enabled and self.input_modality == "full":
             audio_emb, fused_bio = self._apply_modality_dropout(audio_emb, fused_bio)
+
+        if self._quality_aware:
+            if quality is None:
+                batch_size = audio_emb.shape[0]
+                quality = torch.full(
+                    (batch_size, 2),
+                    0.5,
+                    device=audio_emb.device,
+                    dtype=audio_emb.dtype,
+                )
+            return self.fusion(audio_emb, fused_bio, quality=quality)
 
         return self.fusion(audio_emb, fused_bio)
 
@@ -256,6 +275,7 @@ class BrainDrainDetector(nn.Module):
         self,
         waveform: torch.Tensor,
         biosignals: torch.Tensor,
+        quality: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -277,13 +297,21 @@ class BrainDrainDetector(nn.Module):
                 biosignals.shape[2],
                 biosignals.shape[3],
             )
-            fused_flat = self._encode_fused(wf_flat, bio_flat)
+            if quality is not None:
+                if quality.dim() == 3:
+                    quality_flat = quality.reshape(batch_size * num_windows, quality.shape[-1])
+                else:
+                    quality_flat = quality.unsqueeze(1).expand(-1, num_windows, -1)
+                    quality_flat = quality_flat.reshape(batch_size * num_windows, quality.shape[-1])
+            else:
+                quality_flat = None
+            fused_flat = self._encode_fused(wf_flat, bio_flat, quality=quality_flat)
             project_dim = fused_flat.shape[-1]
             fused_seq = fused_flat.reshape(batch_size, num_windows, project_dim)
             fused = self._apply_temporal(fused_seq)
             return self._predict_from_fused(fused)
 
-        fused = self._encode_fused(waveform, biosignals)
+        fused = self._encode_fused(waveform, biosignals, quality=quality)
         if self.inter_window_temporal is not None:
             fused = self._apply_temporal(fused.unsqueeze(1))
         return self._predict_from_fused(fused)

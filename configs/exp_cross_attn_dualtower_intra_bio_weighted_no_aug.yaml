@@ -1,0 +1,28 @@
+# ============================================================
+# Hierarchical dual-tower — intra-bio cross-attn + audio↔bio cross-attn
+# Fair protocol vs cross_attn_pooled_weighted_no_aug (F1 ~0.185)
+# vs legacy dual-tower concat (F1 ~0.126)
+# ============================================================
+defaults:
+  - base
+
+model:
+  fusion_mode: cross_attn_pooled
+  input_modality: full
+  dual_tower_biosignal: true
+  dual_tower:
+    intra_bio_fusion: cross_attn
+    intra_bio_num_heads: 2
+  cross_attn:
+    balanced_residual: false
+  modality_dropout:
+    enabled: false
+
+training:
+  weighted_loss: true
+  balanced_sampling: true
+  selection_metric: macro_f1
+  batch_size: 8
+
+augmentation:
+  enabled: false

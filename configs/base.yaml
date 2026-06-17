@@ -98,6 +98,13 @@ model:
   cross_attn:
     # true → learnable residuals from audio AND biosignal (reduces audio-only skip path)
     balanced_residual: false
+    # Quality-aware fusion: scale tokens by speech overlap + bio completeness;
+    # optional supervision loss on audio-trust gate (see quality_supervision).
+    quality_aware: false
+    quality_min_scale: 0.1
+    quality_supervision:
+      enabled: true
+      lambda: 0.1
 
   # Per-sample modality dropout before fusion (train only, input_modality=full)
   modality_dropout:

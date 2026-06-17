@@ -1,0 +1,29 @@
+# ============================================================
+# Quality-aware cross-attention — same fair protocol as baseline
+# ONLY changes vs cross_attn_pooled_weighted_no_aug:
+#   cross_attn.quality_aware: true
+#   cross_attn.quality_supervision.lambda: 0.1
+# ============================================================
+defaults:
+  - base
+
+model:
+  fusion_mode: cross_attn_pooled
+  input_modality: full
+  dual_tower_biosignal: false
+  cross_attn:
+    balanced_residual: false
+    quality_aware: true
+    quality_min_scale: 0.1
+    quality_supervision:
+      enabled: true
+      lambda: 0.1
+
+training:
+  weighted_loss: true
+  balanced_sampling: true
+  selection_metric: macro_f1
+  batch_size: 8
+
+augmentation:
+  enabled: false

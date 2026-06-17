@@ -31,6 +31,8 @@ class CrossAttentionFusion(nn.Module):
         dropout: float,
         *,
         balanced_residual: bool = False,
+        quality_aware: bool = False,
+        quality_min_scale: float = 0.1,
     ):
         """
         Args:
@@ -42,9 +44,16 @@ class CrossAttentionFusion(nn.Module):
             balanced_residual:
                 false (legacy) — residual from projected audio only (audio-heavy).
                 true — learnable scaled residuals from both audio and biosignal tokens.
+            quality_aware:
+                Modulate projected tokens by per-window quality and learn an
+                audio-trust gate supervised against q_audio / (q_audio + q_bio).
+            quality_min_scale:
+                Floor for quality scaling (avoids zeroing a modality entirely).
         """
         super().__init__()
         self.balanced_residual = bool(balanced_residual)
+        self.quality_aware = bool(quality_aware)
+        self.quality_min_scale = float(quality_min_scale)
 
         self.audio_proj     = nn.Linear(audio_dim,     project_dim)
         self.biosignal_proj = nn.Linear(biosignal_dim, project_dim)
@@ -62,12 +71,32 @@ class CrossAttentionFusion(nn.Module):
             self.audio_residual_weight = nn.Parameter(torch.tensor(0.5))
             self.bio_residual_weight = nn.Parameter(torch.tensor(0.5))
 
+        if self.quality_aware:
+            if self.balanced_residual:
+                raise ValueError("cross_attn quality_aware cannot be combined with balanced_residual")
+            gate_hidden = max(project_dim // 4, 8)
+            self.trust_gate = nn.Sequential(
+                nn.Linear(project_dim * 2 + 2, gate_hidden),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(gate_hidden, 1),
+            )
+
         self.last_attention_weights: torch.Tensor | None = None
+        self.last_audio_trust: torch.Tensor | None = None
+        self.last_quality_target: torch.Tensor | None = None
+
+    def _scale_by_quality(self, tensor: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
+        scale = self.quality_min_scale + (1.0 - self.quality_min_scale) * q
+        while scale.dim() < tensor.dim():
+            scale = scale.unsqueeze(-1)
+        return tensor * scale
 
     def forward(
         self,
         audio_emb: torch.Tensor,
         biosignal_emb: torch.Tensor,
+        quality: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -76,8 +105,20 @@ class CrossAttentionFusion(nn.Module):
         Returns:
             fused: (batch, project_dim)
         """
-        query = self.audio_proj(audio_emb).unsqueeze(1)          # (batch, 1, project_dim)
-        key   = self.biosignal_proj(biosignal_emb).unsqueeze(1)  # (batch, 1, project_dim)
+        if biosignal_emb.dim() == 3:
+            biosignal_emb = biosignal_emb.mean(dim=1)
+
+        query = self.audio_proj(audio_emb)
+        key = self.biosignal_proj(biosignal_emb)
+
+        q_norm: torch.Tensor | None = None
+        if self.quality_aware and quality is not None:
+            q_norm = quality.clamp(min=1e-3)
+            query = self._scale_by_quality(query, q_norm[:, 0:1])
+            key = self._scale_by_quality(key, q_norm[:, 1:2])
+
+        query = query.unsqueeze(1)          # (batch, 1, project_dim)
+        key = key.unsqueeze(1)              # (batch, 1, project_dim)
         value = key
 
         attended, attn_weights = self.attention(
@@ -91,7 +132,17 @@ class CrossAttentionFusion(nn.Module):
         attended = attended.squeeze(1)
         query_t = query.squeeze(1)
         key_t = key.squeeze(1)
-        if self.balanced_residual:
+
+        if self.quality_aware and q_norm is not None:
+            target = q_norm[:, 0:1] / q_norm.sum(dim=-1, keepdim=True)
+            gate_in = torch.cat([query_t, key_t, q_norm], dim=-1)
+            w_audio = torch.sigmoid(self.trust_gate(gate_in))
+            self.last_audio_trust = w_audio
+            self.last_quality_target = target.detach()
+            fused = self.layer_norm(
+                w_audio * query_t + (1.0 - w_audio) * (attended + key_t)
+            )
+        elif self.balanced_residual:
             fused = self.layer_norm(
                 attended
                 + self.audio_residual_weight * query_t
@@ -339,6 +390,8 @@ def build_fusion_layer(
 
     cross_attn = dict(cross_attn_cfg or {})
     balanced_residual = bool(cross_attn.get("balanced_residual", False))
+    quality_aware = bool(cross_attn.get("quality_aware", False))
+    quality_min_scale = float(cross_attn.get("quality_min_scale", 0.1))
 
     if fusion_mode == "cross_attn_pooled":
         return CrossAttentionFusion(
@@ -348,9 +401,15 @@ def build_fusion_layer(
             num_heads=num_heads,
             dropout=dropout,
             balanced_residual=balanced_residual,
+            quality_aware=quality_aware,
+            quality_min_scale=quality_min_scale,
         )
 
     if fusion_mode == "sequence_cross_attn":
+        if quality_aware:
+            raise ValueError(
+                "cross_attn.quality_aware is only supported for fusion_mode=cross_attn_pooled"
+            )
         return SequenceCrossAttentionFusion(
             audio_dim=audio_dim,
             biosignal_dim=biosignal_dim,

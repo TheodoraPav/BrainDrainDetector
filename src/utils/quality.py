@@ -13,8 +13,9 @@ Files used:
 """
 
 import pandas as pd
+import torch
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Iterable, List
 
 
 def load_e4_quality(data_quality_dir: str) -> pd.DataFrame:
@@ -126,6 +127,105 @@ def load_participant_neurosky_quality_means(
             values.append(float(raw))
         scores[participant] = float(np.mean(values)) if values else 0.5
     return scores
+
+
+def resolve_quality_tables_dir(data_raw: str | Path) -> Path:
+    """Locate e4_completeness.csv under common K-EmoCon / Kaggle layouts."""
+    raw = Path(data_raw)
+    candidates = [
+        raw / "data_quality_tables" / "data_quality_tables",
+        raw / "Data" / "data_quality_tables" / "data_quality_tables",
+    ]
+    for path in candidates:
+        if (path / "e4_completeness.csv").is_file():
+            return path
+    raise FileNotFoundError(
+        "e4_completeness.csv not found under data_quality_tables. "
+        f"Tried: {[str(p) for p in candidates]}"
+    )
+
+
+def resolve_processed_audio_dir(data_processed: str | Path, data_raw: str | Path) -> Path:
+    """Audio .pt files from step 02 (speech_overlap_sec metadata)."""
+    processed = Path(data_processed)
+    for candidate in (
+        processed / "audio",
+        Path(data_raw) / "audio" / "audio",
+        Path(data_raw) / "audio",
+    ):
+        if candidate.is_dir() and any(candidate.glob("*.pt")):
+            return candidate
+    return processed / "audio"
+
+
+def load_speech_overlap_index(audio_dir: str | Path) -> Dict[tuple[str, int], float]:
+    """Map (participant, seconds) → speech overlap seconds from step-02 audio .pt files."""
+    index: Dict[tuple[str, int], float] = {}
+    audio_path = Path(audio_dir)
+    if not audio_path.is_dir():
+        return index
+    for pt_file in sorted(audio_path.glob("*.pt")):
+        data = torch.load(pt_file, weights_only=False)
+        participant = data["participant"]
+        seconds = int(data["seconds"])
+        overlap = float(data.get("speech_overlap_sec", 5.0))
+        index[(participant, seconds)] = overlap
+    return index
+
+
+def combined_bio_quality_score(
+    participant: str,
+    e4_quality_by_participant: Dict[str, float],
+    eeg_quality_by_participant: Dict[str, float],
+) -> float:
+    """Single biosignal quality scalar in [0, 1] (mean E4 + EEG completeness)."""
+    e4 = float(e4_quality_by_participant.get(participant, 0.5))
+    eeg = float(eeg_quality_by_participant.get(participant, 0.5))
+    return max((e4 + eeg) / 2.0, 1e-3)
+
+
+def enrich_samples_with_quality(
+    samples: Iterable[dict],
+    *,
+    data_raw: str | Path,
+    data_processed: str | Path,
+    window_size_sec: float = 5.0,
+    e4_signals: List[str] | None = None,
+    eeg_signals: List[str] | None = None,
+    default_audio_overlap_frac: float = 0.6,
+) -> int:
+    """
+    In-place: add ``quality_features`` tensor [q_audio, q_bio] per window sample.
+
+    q_audio = speech_overlap_sec / window_size_sec (clamped to [0, 1])
+    q_bio   = mean participant E4 + EEG completeness in [0, 1]
+    """
+    sample_list = list(samples)
+    if not sample_list:
+        return 0
+
+    quality_dir = resolve_quality_tables_dir(data_raw)
+    e4_signals = list(e4_signals or ["EDA", "HR", "IBI"])
+    eeg_signals = list(eeg_signals or ["theta", "alpha", "beta"])
+
+    e4_quality = load_participant_e4_quality_means(str(quality_dir), signals=e4_signals)
+    eeg_quality = load_participant_neurosky_quality_means(str(quality_dir), signals=eeg_signals)
+    speech_index = load_speech_overlap_index(
+        resolve_processed_audio_dir(data_processed, data_raw),
+    )
+
+    default_overlap = float(default_audio_overlap_frac) * float(window_size_sec)
+    for sample in sample_list:
+        participant = sample["participant"]
+        seconds = int(sample.get("seconds", 0))
+        overlap = speech_index.get((participant, seconds), default_overlap)
+        q_audio = max(min(float(overlap) / float(window_size_sec), 1.0), 1e-3)
+        q_bio = combined_bio_quality_score(participant, e4_quality, eeg_quality)
+        sample["quality_features"] = torch.tensor(
+            [q_audio, q_bio],
+            dtype=torch.float32,
+        )
+    return len(sample_list)
 
 
 def build_quality_map(data_quality_dir: str, signals: list = None) -> Dict[int, bool]:

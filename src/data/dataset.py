@@ -35,6 +35,7 @@ class BrainDrainDataset(Dataset):
         samples: List[dict],
         task_mode: str = "classification",
         labels_cfg=None,
+        return_quality: bool = False,
     ):
         """
         Args:
@@ -48,6 +49,7 @@ class BrainDrainDataset(Dataset):
         self.samples    = samples
         self.task_mode  = task_mode
         self.labels_cfg = labels_cfg
+        self.return_quality = return_quality
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -112,6 +114,15 @@ class BrainDrainDataset(Dataset):
         else:
             target = merge_to_binary(int(sample["label"]))
 
+        if self.return_quality:
+            quality = sample.get("quality_features")
+            if quality is None:
+                raise KeyError(
+                    f"Sample {sample.get('participant', '?')} sec={sample.get('seconds', '?')} "
+                    "missing quality_features — enable cross_attn.quality_aware and re-run step 05."
+                )
+            return audio_input, biosignals, target, quality
+
         return audio_input, biosignals, target
 
 
@@ -170,6 +181,7 @@ class WindowSequenceDataset(Dataset):
         task_mode: str = "classification",
         labels_cfg=None,
         num_windows: int = 5,
+        return_quality: bool = False,
     ):
         if num_windows < 1:
             raise ValueError(f"num_windows must be >= 1, got {num_windows}")
@@ -177,6 +189,7 @@ class WindowSequenceDataset(Dataset):
         self.task_mode = task_mode
         self.labels_cfg = labels_cfg
         self.num_windows = num_windows
+        self.return_quality = return_quality
 
         by_participant: Dict[str, List[Tuple[float, int]]] = defaultdict(list)
         for idx, sample in enumerate(samples):
@@ -214,6 +227,11 @@ class WindowSequenceDataset(Dataset):
         audio_seq = torch.stack([_sample_audio_tensor(self.samples[i]) for i in ctx_indices])
         bio_seq = torch.stack([self.samples[i]["biosignals"] for i in ctx_indices])
         target = _resolve_target(self.samples[end_idx], self.task_mode, self.labels_cfg)
+        if self.return_quality:
+            quality_seq = torch.stack(
+                [self.samples[i]["quality_features"] for i in ctx_indices],
+            )
+            return audio_seq, bio_seq, target, quality_seq
         return audio_seq, bio_seq, target
 
 
@@ -222,6 +240,7 @@ def make_brain_drain_dataset(
     task_mode: str,
     labels_cfg=None,
     temporal_cfg: dict | None = None,
+    return_quality: bool = False,
 ) -> Dataset:
     """
     Returns BrainDrainDataset (single window) or WindowSequenceDataset when temporal is on.
@@ -235,8 +254,11 @@ def make_brain_drain_dataset(
             task_mode=task_mode,
             labels_cfg=labels_cfg,
             num_windows=int(temporal_cfg.get("num_windows", 5)),
+            return_quality=return_quality,
         )
-    return BrainDrainDataset(samples, task_mode=task_mode, labels_cfg=labels_cfg)
+    return BrainDrainDataset(
+        samples, task_mode=task_mode, labels_cfg=labels_cfg, return_quality=return_quality,
+    )
 
 
 def load_all_samples(data_processed_dir: str) -> List[dict]:

@@ -67,6 +67,7 @@ from utils.va_separated_classify import (
 )
 from utils.early_stopping import early_stopping_should_stop, update_validation_score
 from utils.pipeline_log import format_count_summary, log_participant_counts, log_stats, stage_ok, stage_start
+from utils.quality import enrich_samples_with_quality
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -217,6 +218,29 @@ def _gmu_gate_regularization(gate_z: torch.Tensor) -> torch.Tensor:
     bar_z = gate_z.mean(dim=0).clamp(1e-6, 1.0 - 1e-6)
     entropy = -(bar_z * bar_z.log() + (1.0 - bar_z) * (1.0 - bar_z).log())
     return -entropy.mean()
+
+
+def _cross_attn_quality_settings(cfg) -> dict:
+    """Quality-supervised audio-trust loss for cross_attn.quality_aware."""
+    cross = dict(cfg.model.get("cross_attn", {}) or {})
+    quality_aware = bool(cross.get("quality_aware", False))
+    sup = dict(cross.get("quality_supervision", {}) or {})
+    enabled = quality_aware and bool(sup.get("enabled", True))
+    return {
+        "dataset": quality_aware,
+        "enabled": enabled,
+        "lambda": float(sup.get("lambda", 0.1)) if enabled else 0.0,
+    }
+
+
+def _cross_attn_quality_supervision_loss(
+    audio_trust: torch.Tensor,
+    quality_target: torch.Tensor,
+) -> torch.Tensor:
+    return nn.functional.mse_loss(
+        audio_trust.squeeze(-1),
+        quality_target.squeeze(-1),
+    )
 
 
 def _resolve_va_loss_settings(cfg) -> dict:
@@ -479,6 +503,7 @@ def run_one_epoch(
     use_amp: bool = False,
     scaler: torch.amp.GradScaler | None = None,
     gmu_gate_reg_lambda: float = 0.0,
+    cross_attn_quality_lambda: float = 0.0,
 ):
     """
     Runs one training or validation epoch.
@@ -503,23 +528,39 @@ def run_one_epoch(
     amp_enabled = use_amp and device.type == "cuda"
 
     with context:
-        for waveform, biosignals, targets in loader:
+        for batch in loader:
+            if len(batch) == 4:
+                waveform, biosignals, targets, quality = batch
+                quality = quality.to(device)
+            else:
+                waveform, biosignals, targets = batch
+                quality = None
+
             waveform   = waveform.to(device)
             biosignals = biosignals.to(device)
             targets    = targets.to(device)
 
             if amp_enabled:
                 with torch.amp.autocast("cuda"):
-                    output = model(waveform, biosignals)
+                    output = model(waveform, biosignals, quality=quality)
                     loss   = criterion(output, targets)
             else:
-                output = model(waveform, biosignals)
+                output = model(waveform, biosignals, quality=quality)
                 loss   = criterion(output, targets)
 
             if is_training and gmu_gate_reg_lambda > 0.0:
                 gate_z = getattr(getattr(model, "fusion", None), "last_gate_z", None)
                 if gate_z is not None:
                     loss = loss + gmu_gate_reg_lambda * _gmu_gate_regularization(gate_z)
+
+            if is_training and cross_attn_quality_lambda > 0.0:
+                fusion = getattr(model, "fusion", None)
+                audio_trust = getattr(fusion, "last_audio_trust", None)
+                quality_target = getattr(fusion, "last_quality_target", None)
+                if audio_trust is not None and quality_target is not None:
+                    loss = loss + cross_attn_quality_lambda * _cross_attn_quality_supervision_loss(
+                        audio_trust, quality_target,
+                    )
 
             if is_training:
                 optimizer.zero_grad(set_to_none=True)
@@ -617,14 +658,19 @@ def train_one_fold(
 
     labels_cfg = cfg.labels
     temporal_cfg = _temporal_cfg(cfg)
+    quality_train = _cross_attn_quality_settings(cfg)
+    return_quality = quality_train["dataset"]
     train_dataset = make_brain_drain_dataset(
         fit_samples, task_mode=task_mode, labels_cfg=labels_cfg, temporal_cfg=temporal_cfg,
+        return_quality=return_quality,
     )
     val_dataset = make_brain_drain_dataset(
         val_samples, task_mode=task_mode, labels_cfg=labels_cfg, temporal_cfg=temporal_cfg,
+        return_quality=return_quality,
     )
     test_dataset = make_brain_drain_dataset(
         test_samples, task_mode=task_mode, labels_cfg=labels_cfg, temporal_cfg=temporal_cfg,
+        return_quality=return_quality,
     )
     physio_cnn = _physio_cnn_cfg(cfg)
     if bool(physio_cnn.get("enabled", False)):
@@ -754,6 +800,12 @@ def train_one_fold(
     gmu_train = _gmu_training_settings(cfg)
     if gmu_train["enabled"]:
         print(f"  GMU gate regularization: lambda={gmu_train['lambda']:.4f}")
+    quality_train = _cross_attn_quality_settings(cfg)
+    if quality_train["dataset"]:
+        print(
+            f"  Quality-aware cross-attn: supervision lambda="
+            f"{quality_train['lambda']:.4f}"
+        )
     patience  = int(cfg.training.get("early_stopping_patience", 0))
     min_epochs = int(cfg.training.get("early_stopping_min_epochs", 1))
     epochs_without_improvement = 0
@@ -796,11 +848,13 @@ def train_one_fold(
             model, train_loader, criterion, optimizer, device,
             is_training=True, task_mode=task_mode, use_amp=use_amp, scaler=scaler,
             gmu_gate_reg_lambda=gmu_train["lambda"],
+            cross_attn_quality_lambda=quality_train["lambda"],
         )
         val_loss, val_labels, val_preds, _ = run_one_epoch(
             model, val_loader, criterion, optimizer, device,
             is_training=False, task_mode=task_mode, use_amp=use_amp,
             gmu_gate_reg_lambda=0.0,
+            cross_attn_quality_lambda=0.0,
         )
         epochs_run = epoch + 1
 
@@ -1314,6 +1368,18 @@ def main(cfg):
             f"No training samples found in {Path(cfg.paths.data_processed) / windows_dir}. "
             "Step 04 likely saved 0 windows — check step 03 (physio) output first."
         )
+
+    quality_settings = _cross_attn_quality_settings(cfg)
+    if quality_settings["dataset"]:
+        enriched = enrich_samples_with_quality(
+            samples,
+            data_raw=cfg.paths.data_raw,
+            data_processed=cfg.paths.data_processed,
+            window_size_sec=float(cfg.data.window_size_sec),
+            e4_signals=list(cfg.data.e4_signals),
+            eeg_signals=list(cfg.data.eeg_signals),
+        )
+        print(f"Enriched {enriched} windows with quality_features (audio overlap + bio completeness).")
 
     if _is_any_regression_task(task_mode):
         _validate_regression_samples(samples, task_mode)
