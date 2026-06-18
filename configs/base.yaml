@@ -40,6 +40,10 @@ data:
   vad_min_overlap_pct: 0.60    # or when speech covers at least 60% of the window
   e4_signals: ["EDA", "HR", "IBI"]
   eeg_signals: ["theta", "alpha", "beta"]
+  # Step 03 z-score scope:
+  #   per_participant — stats over full debate (keeps tonic arousal across windows)
+  #   per_window      — legacy per 5 s window (removes between-window level)
+  physio_normalization: per_participant
 
 # ============================================================
 # Labels

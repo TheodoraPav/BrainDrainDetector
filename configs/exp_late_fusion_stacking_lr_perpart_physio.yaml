@@ -1,0 +1,21 @@
+# Late fusion stacking_lr with per-participant physio normalization (step 03).
+defaults:
+  - base
+
+data:
+  physio_normalization: per_participant
+
+late_fusion:
+  output_root: "results/late_fusion_runs"
+  methods:
+    - stacking_lr
+  active_method: stacking_lr
+
+training:
+  weighted_loss: true
+  balanced_sampling: true
+  selection_metric: macro_f1
+  batch_size: 8
+
+augmentation:
+  enabled: false

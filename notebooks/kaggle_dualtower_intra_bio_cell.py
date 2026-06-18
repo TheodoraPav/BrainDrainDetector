@@ -38,8 +38,31 @@ from pathlib import Path
 from huggingface_hub import login
 from omegaconf import OmegaConf
 
-CELL_VERSION = "2026-06-16-dualtower-intra-bio-onecell-v1"
+CELL_VERSION = "2026-06-16-dualtower-intra-bio-onecell-v2"
 ZIP_OUTPUT_NAME = "results_classification_cross_attn_dualtower_intra_bio_weighted_no_aug.zip"
+EXP_CONFIG_NAME = "exp_cross_attn_dualtower_intra_bio_weighted_no_aug.yaml"
+
+# Inline fallback when exp yaml is not yet on master (cell still runs).
+INLINE_EXP_OVERRIDES = {
+    "model": {
+        "fusion_mode": "cross_attn_pooled",
+        "input_modality": "full",
+        "dual_tower_biosignal": True,
+        "dual_tower": {
+            "intra_bio_fusion": "cross_attn",
+            "intra_bio_num_heads": 2,
+        },
+        "cross_attn": {"balanced_residual": False},
+        "modality_dropout": {"enabled": False},
+    },
+    "training": {
+        "weighted_loss": True,
+        "balanced_sampling": True,
+        "selection_metric": "macro_f1",
+        "batch_size": 8,
+    },
+    "augmentation": {"enabled": False},
+}
 
 REPO = Path("/kaggle/working/BrainDrainDetector")
 GIT_URL = "https://github.com/TheodoraPav/BrainDrainDetector.git"
@@ -101,21 +124,33 @@ def verify_repo() -> None:
         REPO / "src/models/classifier.py",
         REPO / "src/05_train.py",
         REPO / "configs/base.yaml",
-        REPO / "configs/exp_cross_attn_dualtower_intra_bio_weighted_no_aug.yaml",
     ]
     missing = [str(p) for p in required if not p.is_file()]
     if missing:
         raise FileNotFoundError(
-            "Missing files — git push master OR upload late_fusion_patch:\n  "
+            "Missing core files — git push master OR upload late_fusion_patch:\n  "
             + "\n  ".join(missing)
         )
     fusion_src = (REPO / "src/models/fusion.py").read_text(encoding="utf-8")
     if "build_bio_intra_fusion_layer" not in fusion_src:
-        raise RuntimeError("fusion.py lacks build_bio_intra_fusion_layer — push latest code.")
+        raise RuntimeError(
+            "fusion.py lacks build_bio_intra_fusion_layer — push latest src/ OR "
+            f"upload dataset/{PATCH_REL}/src/models/fusion.py"
+        )
     clf_src = (REPO / "src/models/classifier.py").read_text(encoding="utf-8")
     if "bio_intra_fusion" not in clf_src:
-        raise RuntimeError("classifier.py lacks bio_intra_fusion — push latest code.")
-    print("[Kaggle] Repo check OK (dual-tower intra-bio code present).")
+        raise RuntimeError(
+            "classifier.py lacks bio_intra_fusion — push latest src/ OR "
+            f"upload dataset/{PATCH_REL}/src/models/classifier.py"
+        )
+    exp_path = REPO / "configs" / EXP_CONFIG_NAME
+    if exp_path.is_file():
+        print(f"[Kaggle] Repo check OK (found {EXP_CONFIG_NAME}).")
+    else:
+        print(
+            f"[Kaggle] Repo check OK — {EXP_CONFIG_NAME} missing on master; "
+            "using INLINE_EXP_OVERRIDES from cell."
+        )
 
 
 def install_deps() -> None:
@@ -161,9 +196,14 @@ def hf_login() -> None:
 
 def load_cfg(kemocon_root: Path) -> OmegaConf:
     base = OmegaConf.load(REPO / "configs/base.yaml")
-    exp_path = REPO / "configs/exp_cross_attn_dualtower_intra_bio_weighted_no_aug.yaml"
-    exp = OmegaConf.to_container(OmegaConf.load(exp_path), resolve=True)
-    exp.pop("defaults", None)
+    exp_path = REPO / "configs" / EXP_CONFIG_NAME
+    if exp_path.is_file():
+        exp = OmegaConf.to_container(OmegaConf.load(exp_path), resolve=True)
+        exp.pop("defaults", None)
+        print(f"[Kaggle] Loaded experiment config: {exp_path.name}")
+    else:
+        exp = INLINE_EXP_OVERRIDES
+        print(f"[Kaggle] Using inline experiment overrides (no {EXP_CONFIG_NAME} on master).")
     cfg = OmegaConf.merge(base, OmegaConf.create(exp))
     cfg.paths.data_raw = str(kemocon_root)
     cfg.paths.data_processed = "/kaggle/working/data_processed"

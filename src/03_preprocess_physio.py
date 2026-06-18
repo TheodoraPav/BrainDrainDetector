@@ -300,9 +300,21 @@ def extract_windows_legacy(
 
 
 def z_score_normalize(tensor: torch.Tensor) -> torch.Tensor:
-    """Normalizes each channel to zero mean and unit variance."""
+    """Per-window z-score (legacy)."""
     mean = tensor.mean(dim=0, keepdim=True)
     std = tensor.std(dim=0, keepdim=True).clamp(min=1e-8)
+    return (tensor - mean) / std
+
+
+def compute_participant_norm_stats(windows: list) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-channel mean/std over all debate windows for one participant."""
+    stacked = torch.cat([w["biosignals"] for w in windows], dim=0)
+    mean = stacked.mean(dim=0, keepdim=True)
+    std = stacked.std(dim=0, keepdim=True).clamp(min=1e-8)
+    return mean, std
+
+
+def apply_norm_stats(tensor: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
     return (tensor - mean) / std
 
 
@@ -329,6 +341,12 @@ def main(cfg):
 
     window_size_sec = cfg.data.window_size_sec
     target_steps_per_window = 50  # 10 Hz internal grid per 5-second window
+    norm_scope = str(cfg.data.get("physio_normalization", "per_participant")).lower()
+    if norm_scope not in ("per_participant", "per_window"):
+        raise ValueError(
+            f"data.physio_normalization must be 'per_participant' or 'per_window', got {norm_scope!r}"
+        )
+    print(f"Physio normalization scope: {norm_scope}")
 
     participant_dirs = sorted(
         (p for p in e4_dir.iterdir() if p.is_dir() and p.name.isdigit()),
@@ -381,8 +399,15 @@ def main(cfg):
         counts_by_participant[participant_id] = len(windows)
         print(f"  {participant_id}: {len(windows)} physio windows extracted")
 
+        norm_mean = norm_std = None
+        if norm_scope == "per_participant" and windows:
+            norm_mean, norm_std = compute_participant_norm_stats(windows)
+
         for window_dict in windows:
-            biosignals = z_score_normalize(window_dict["biosignals"])
+            if norm_scope == "per_participant":
+                biosignals = apply_norm_stats(window_dict["biosignals"], norm_mean, norm_std)
+            else:
+                biosignals = z_score_normalize(window_dict["biosignals"])
             save_dict = {
                 "biosignals": biosignals,
                 "participant": participant_id,
@@ -398,6 +423,7 @@ def main(cfg):
         "participants_processed": len(counts_by_participant),
         "participants_skipped": len(skipped_participants),
         "total_windows": total_windows,
+        "physio_normalization": norm_scope,
         "windows_per_participant": format_count_summary(counts_by_participant.values()),
         "output_dir": str(output_dir),
     })
