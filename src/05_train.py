@@ -142,6 +142,14 @@ def _physio_cnn_cfg(cfg) -> dict:
     return dict(cfg.model.get("physio_cnn", {}) or {})
 
 
+def _physio_encoder_type(cfg) -> str:
+    return str(cfg.model.get("physio_encoder", "bigru")).lower()
+
+
+def _use_physio_features(cfg) -> bool:
+    return _physio_encoder_type(cfg) == "feature_mlp"
+
+
 def _temporal_signature(cfg) -> dict:
     """Stable metadata stored in loso_results.pt to detect stale skip-if-exists runs."""
     t = _temporal_cfg(cfg)
@@ -166,6 +174,7 @@ def _temporal_signature(cfg) -> dict:
         "cross_attn_balanced_residual": bool(cross_attn.get("balanced_residual", False)),
         "modality_dropout_enabled": bool(mod_drop.get("enabled", False)),
         "modality_dropout_p": float(mod_drop.get("p", 0.15)),
+        "physio_encoder": _physio_encoder_type(cfg),
     }
     if pc_on:
         sig["physio_cnn_out_channels"] = int(pc.get("out_channels", 32))
@@ -533,6 +542,8 @@ def run_one_epoch(
     scaler: torch.amp.GradScaler | None = None,
     gmu_gate_reg_lambda: float = 0.0,
     cross_attn_quality_lambda: float = 0.0,
+    return_physio_features: bool = False,
+    return_quality: bool = False,
 ):
     """
     Runs one training or validation epoch.
@@ -558,20 +569,32 @@ def run_one_epoch(
 
     with context:
         for batch in loader:
-            if len(batch) == 4:
-                waveform, biosignals, targets, quality = batch
-                quality = quality.to(device)
+            physio_features = None
+            quality = None
+            if len(batch) == 5:
+                waveform, biosignals, targets, quality, physio_features = batch
+            elif len(batch) == 4:
+                waveform, biosignals, targets, extra = batch
+                if return_physio_features:
+                    physio_features = extra
+                else:
+                    quality = extra
             else:
                 waveform, biosignals, targets = batch
-                quality = None
 
             waveform   = waveform.to(device)
             biosignals = biosignals.to(device)
             targets    = targets.to(device)
+            if quality is not None:
+                quality = quality.to(device)
+            if physio_features is not None:
+                physio_features = physio_features.to(device)
 
             if amp_enabled:
                 with torch.amp.autocast("cuda"):
-                    output = model(waveform, biosignals, quality=quality)
+                    output = model(
+                        waveform, biosignals, quality=quality, physio_features=physio_features,
+                    )
                     loss = criterion(output, targets)
                     loss = _add_fusion_auxiliary_losses(
                         model,
@@ -581,7 +604,9 @@ def run_one_epoch(
                         cross_attn_quality_lambda=cross_attn_quality_lambda,
                     )
             else:
-                output = model(waveform, biosignals, quality=quality)
+                output = model(
+                    waveform, biosignals, quality=quality, physio_features=physio_features,
+                )
                 loss = criterion(output, targets)
                 loss = _add_fusion_auxiliary_losses(
                     model,
@@ -689,20 +714,30 @@ def train_one_fold(
     temporal_cfg = _temporal_cfg(cfg)
     quality_train = _cross_attn_quality_settings(cfg)
     return_quality = quality_train["dataset"]
+    return_physio_features = _use_physio_features(cfg)
     train_dataset = make_brain_drain_dataset(
         fit_samples, task_mode=task_mode, labels_cfg=labels_cfg, temporal_cfg=temporal_cfg,
         return_quality=return_quality,
+        return_physio_features=return_physio_features,
     )
     val_dataset = make_brain_drain_dataset(
         val_samples, task_mode=task_mode, labels_cfg=labels_cfg, temporal_cfg=temporal_cfg,
         return_quality=return_quality,
+        return_physio_features=return_physio_features,
     )
     test_dataset = make_brain_drain_dataset(
         test_samples, task_mode=task_mode, labels_cfg=labels_cfg, temporal_cfg=temporal_cfg,
         return_quality=return_quality,
+        return_physio_features=return_physio_features,
     )
     physio_cnn = _physio_cnn_cfg(cfg)
-    if bool(physio_cnn.get("enabled", False)):
+    if _use_physio_features(cfg):
+        print(
+            f"  Physio encoder: feature MLP "
+            f"(input_dim={cfg.model.get('physio_feature_dim', 15)}, "
+            f"hidden={cfg.model.biosignal_hidden_size} -> {cfg.model.biosignal_hidden_size * 2}-d)"
+        )
+    elif bool(physio_cnn.get("enabled", False)):
         print(
             f"  Physio encoder: 1D CNN + BiGRU "
             f"(out_channels={physio_cnn.get('out_channels', 32)}, "
@@ -878,12 +913,16 @@ def train_one_fold(
             is_training=True, task_mode=task_mode, use_amp=use_amp, scaler=scaler,
             gmu_gate_reg_lambda=gmu_train["lambda"],
             cross_attn_quality_lambda=quality_train["lambda"],
+            return_physio_features=return_physio_features,
+            return_quality=return_quality,
         )
         val_loss, val_labels, val_preds, _ = run_one_epoch(
             model, val_loader, criterion, optimizer, device,
             is_training=False, task_mode=task_mode, use_amp=use_amp,
             gmu_gate_reg_lambda=0.0,
             cross_attn_quality_lambda=0.0,
+            return_physio_features=return_physio_features,
+            return_quality=return_quality,
         )
         epochs_run = epoch + 1
 
@@ -917,6 +956,8 @@ def train_one_fold(
     _, final_labels, final_preds, final_probs = run_one_epoch(
         model, test_loader, criterion, None, device,
         is_training=False, task_mode=task_mode, use_amp=use_amp,
+        return_physio_features=return_physio_features,
+        return_quality=return_quality,
     )
 
     fold_metrics = _build_fold_metrics(
@@ -1124,6 +1165,8 @@ def _evaluate_fold_checkpoint(
             task_mode=task_mode,
             labels_cfg=cfg.labels,
             temporal_cfg=_temporal_cfg(cfg),
+            return_physio_features=_use_physio_features(cfg),
+            return_quality=_cross_attn_quality_settings(cfg)["dataset"],
         ),
         batch_size=cfg.training.batch_size,
         shuffle=False,
@@ -1132,6 +1175,8 @@ def _evaluate_fold_checkpoint(
     _, final_labels, final_preds, final_probs = run_one_epoch(
         model, test_loader, criterion, None, device,
         is_training=False, task_mode=task_mode,
+        return_physio_features=_use_physio_features(cfg),
+        return_quality=_cross_attn_quality_settings(cfg)["dataset"],
     )
     return _build_fold_metrics(final_labels, final_preds, final_probs, test_participant, task_mode, cfg)
 

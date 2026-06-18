@@ -133,6 +133,34 @@ class BiosignalEncoder(nn.Module):
         return self.tower(x)
 
 
+class PhysioFeatureMLPEncoder(nn.Module):
+    """MLP on hand-crafted per-window physio features (replaces BiGRU on sparse HR/IBI)."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_size: int,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        out_dim = hidden_size * 2
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, out_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+        )
+        self.embedding_dim = out_dim
+
+    def uses_physio_cnn(self) -> bool:
+        return False
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.mlp(x)
+
+
 class DualTowerBiosignalEncoder(nn.Module):
     """
     Separate BiGRU encoders for E4 and EEG.
@@ -208,7 +236,22 @@ def build_biosignal_encoder(
     return_sequence: bool,
     physio_cnn: dict | None = None,
     split_tower_outputs: bool = False,
+    physio_encoder: str = "bigru",
+    physio_feature_dim: int = 15,
+    feature_mlp_dropout: float = 0.1,
 ) -> nn.Module:
+    if physio_encoder == "feature_mlp":
+        if dual_tower or return_sequence or split_tower_outputs:
+            raise ValueError(
+                "physio_encoder=feature_mlp requires dual_tower=false and "
+                "fusion_mode=cross_attn_pooled (not sequence_cross_attn)."
+            )
+        return PhysioFeatureMLPEncoder(
+            input_dim=physio_feature_dim,
+            hidden_size=hidden_size,
+            dropout=feature_mlp_dropout,
+        )
+
     if dual_tower:
         return DualTowerBiosignalEncoder(
             num_e4_signals=num_e4_signals,

@@ -36,6 +36,7 @@ class BrainDrainDataset(Dataset):
         task_mode: str = "classification",
         labels_cfg=None,
         return_quality: bool = False,
+        return_physio_features: bool = False,
     ):
         """
         Args:
@@ -50,6 +51,7 @@ class BrainDrainDataset(Dataset):
         self.task_mode  = task_mode
         self.labels_cfg = labels_cfg
         self.return_quality = return_quality
+        self.return_physio_features = return_physio_features
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -121,7 +123,24 @@ class BrainDrainDataset(Dataset):
                     f"Sample {sample.get('participant', '?')} sec={sample.get('seconds', '?')} "
                     "missing quality_features — enable cross_attn.quality_aware and re-run step 05."
                 )
+            if self.return_physio_features:
+                physio_features = sample.get("physio_features")
+                if physio_features is None:
+                    raise KeyError(
+                        f"Sample {sample.get('participant', '?')} sec={sample.get('seconds', '?')} "
+                        "missing physio_features — re-run steps 03–04 with feature extraction."
+                    )
+                return audio_input, biosignals, target, quality, physio_features
             return audio_input, biosignals, target, quality
+
+        if self.return_physio_features:
+            physio_features = sample.get("physio_features")
+            if physio_features is None:
+                raise KeyError(
+                    f"Sample {sample.get('participant', '?')} sec={sample.get('seconds', '?')} "
+                    "missing physio_features — re-run steps 03–04 with feature extraction."
+                )
+            return audio_input, biosignals, target, physio_features
 
         return audio_input, biosignals, target
 
@@ -182,6 +201,7 @@ class WindowSequenceDataset(Dataset):
         labels_cfg=None,
         num_windows: int = 5,
         return_quality: bool = False,
+        return_physio_features: bool = False,
     ):
         if num_windows < 1:
             raise ValueError(f"num_windows must be >= 1, got {num_windows}")
@@ -190,6 +210,7 @@ class WindowSequenceDataset(Dataset):
         self.labels_cfg = labels_cfg
         self.num_windows = num_windows
         self.return_quality = return_quality
+        self.return_physio_features = return_physio_features
 
         by_participant: Dict[str, List[Tuple[float, int]]] = defaultdict(list)
         for idx, sample in enumerate(samples):
@@ -231,7 +252,17 @@ class WindowSequenceDataset(Dataset):
             quality_seq = torch.stack(
                 [self.samples[i]["quality_features"] for i in ctx_indices],
             )
+            if self.return_physio_features:
+                physio_seq = torch.stack(
+                    [self.samples[i]["physio_features"] for i in ctx_indices],
+                )
+                return audio_seq, bio_seq, target, quality_seq, physio_seq
             return audio_seq, bio_seq, target, quality_seq
+        if self.return_physio_features:
+            physio_seq = torch.stack(
+                [self.samples[i]["physio_features"] for i in ctx_indices],
+            )
+            return audio_seq, bio_seq, target, physio_seq
         return audio_seq, bio_seq, target
 
 
@@ -241,6 +272,7 @@ def make_brain_drain_dataset(
     labels_cfg=None,
     temporal_cfg: dict | None = None,
     return_quality: bool = False,
+    return_physio_features: bool = False,
 ) -> Dataset:
     """
     Returns BrainDrainDataset (single window) or WindowSequenceDataset when temporal is on.
@@ -255,9 +287,14 @@ def make_brain_drain_dataset(
             labels_cfg=labels_cfg,
             num_windows=int(temporal_cfg.get("num_windows", 5)),
             return_quality=return_quality,
+            return_physio_features=return_physio_features,
         )
     return BrainDrainDataset(
-        samples, task_mode=task_mode, labels_cfg=labels_cfg, return_quality=return_quality,
+        samples,
+        task_mode=task_mode,
+        labels_cfg=labels_cfg,
+        return_quality=return_quality,
+        return_physio_features=return_physio_features,
     )
 
 

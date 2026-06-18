@@ -1,0 +1,26 @@
+# Fair comparison vs cross_attn_pooled_weighted_no_aug (BiGRU baseline).
+# ONLY change: physio_encoder=feature_mlp (hand-crafted HRV/EDA/EEG features + MLP → 256-d)
+defaults:
+  - base
+
+model:
+  fusion_mode: cross_attn_pooled
+  input_modality: full
+  dual_tower_biosignal: false
+  physio_encoder: feature_mlp
+  physio_feature_dim: 15
+  feature_mlp_dropout: 0.1
+  cross_attn:
+    balanced_residual: false
+    quality_aware: false
+  modality_dropout:
+    enabled: false
+
+training:
+  weighted_loss: true
+  balanced_sampling: true
+  selection_metric: macro_f1
+  batch_size: 8
+
+augmentation:
+  enabled: false

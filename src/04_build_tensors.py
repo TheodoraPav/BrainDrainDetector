@@ -49,12 +49,12 @@ def load_audio_index(audio_dir: Path) -> dict:
 
 
 def load_physio_index(physio_dir: Path) -> dict:
-    """Returns dict mapping (participant, seconds) → biosignals tensor."""
+    """Returns dict mapping (participant, seconds) → physio window dict."""
     index = {}
     for pt_file in sorted(physio_dir.glob("*.pt")):
         data = torch.load(pt_file, weights_only=True)
         key  = (data["participant"], data["seconds"])
-        index[key] = data["biosignals"]
+        index[key] = data
     return index
 
 
@@ -123,12 +123,15 @@ def main(cfg):
             skipped_count += 1
             continue
 
+        physio_entry = physio_index[key]
         sample = {
             "waveform":    audio_index[key],
-            "biosignals":  physio_index[key],
+            "biosignals":  physio_entry["biosignals"],
             "label":       label,
             "participant": participant,
         }
+        if "physio_features" in physio_entry:
+            sample["physio_features"] = physio_entry["physio_features"]
 
         if use_annotations and row["arousal"] is not None and row["valence"] is not None:
             sample["arousal"] = int(row["arousal"])
@@ -147,6 +150,9 @@ def main(cfg):
                 sample["waveform"].clone(), sample["biosignals"].clone()
             )
             aug_sample = {**sample, "waveform": aug_waveform, "biosignals": aug_biosignals}
+            if "physio_features" in sample:
+                from utils.physio_features import extract_physio_features_tensor
+                aug_sample["physio_features"] = extract_physio_features_tensor(aug_biosignals)
             torch.save(aug_sample, aug_output_dir / filename)
 
     log_stats("04", {

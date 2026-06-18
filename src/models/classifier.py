@@ -32,6 +32,7 @@ from .audio_encoder import AudioEncoder
 from .biosignal_encoder import build_biosignal_encoder
 from .fusion import build_bio_intra_fusion_layer, build_fusion_layer
 from .temporal import build_inter_window_temporal, temporal_output_dim
+from utils.physio_features import PHYSIO_FEATURE_DIM
 
 
 DEFAULT_FUSION_MODE = "cross_attn_pooled"
@@ -90,6 +91,11 @@ class BrainDrainDetector(nn.Module):
                 "cross_attn_pooled (not sequence_cross_attn)."
             )
 
+        self._physio_encoder = str(cfg.get("physio_encoder", "bigru")).lower()
+        self._use_physio_features = self._physio_encoder == "feature_mlp"
+        if self._use_physio_features and self._dual_tower:
+            raise ValueError("physio_encoder=feature_mlp is incompatible with dual_tower_biosignal.")
+
         self.biosignal_encoder = build_biosignal_encoder(
             dual_tower=self._dual_tower,
             num_e4_signals=len(e4_signals),
@@ -99,6 +105,9 @@ class BrainDrainDetector(nn.Module):
             return_sequence=biosignal_returns_sequence,
             physio_cnn=cfg.get("physio_cnn", {}),
             split_tower_outputs=self._use_intra_bio_attn,
+            physio_encoder=self._physio_encoder,
+            physio_feature_dim=int(cfg.get("physio_feature_dim", PHYSIO_FEATURE_DIM)),
+            feature_mlp_dropout=float(cfg.get("feature_mlp_dropout", 0.1)),
         )
 
         project_dim = cfg["biosignal_hidden_size"] * 2
@@ -165,6 +174,7 @@ class BrainDrainDetector(nn.Module):
         waveform: torch.Tensor,
         biosignals: torch.Tensor,
         quality: torch.Tensor | None = None,
+        physio_features: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Single-window fused embedding (batch, project_dim)."""
         if (
@@ -176,14 +186,21 @@ class BrainDrainDetector(nn.Module):
         else:
             audio_emb = self.audio_encoder(waveform)
 
-        if self.input_modality in ("e4_only", "eeg_only"):
-            biosignals = biosignals.clone()
-            if self.input_modality == "e4_only":
-                biosignals[..., self._num_e4_signals :] = 0
-            else:
-                biosignals[..., : self._num_e4_signals] = 0
+        if self._use_physio_features:
+            if physio_features is None:
+                raise ValueError(
+                    "physio_features required when model.physio_encoder=feature_mlp"
+                )
+            biosignal_output = self.biosignal_encoder(physio_features)
+        else:
+            if self.input_modality in ("e4_only", "eeg_only"):
+                biosignals = biosignals.clone()
+                if self.input_modality == "e4_only":
+                    biosignals[..., self._num_e4_signals :] = 0
+                else:
+                    biosignals[..., : self._num_e4_signals] = 0
 
-        biosignal_output = self.biosignal_encoder(biosignals)
+            biosignal_output = self.biosignal_encoder(biosignals)
 
         if self.input_modality == "audio_only":
             biosignal_output = self._zero_biosignal_output(biosignal_output)
@@ -276,11 +293,13 @@ class BrainDrainDetector(nn.Module):
         waveform: torch.Tensor,
         biosignals: torch.Tensor,
         quality: torch.Tensor | None = None,
+        physio_features: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Args:
             waveform:   (batch, audio_samples) or (batch, 768) if embedding cached
             biosignals: (batch, time_steps, num_signals)
+            physio_features: (batch, feature_dim) when physio_encoder=feature_mlp
 
         Returns:
             classification:  logits  (batch, num_classes)
@@ -305,13 +324,21 @@ class BrainDrainDetector(nn.Module):
                     quality_flat = quality_flat.reshape(batch_size * num_windows, quality.shape[-1])
             else:
                 quality_flat = None
-            fused_flat = self._encode_fused(wf_flat, bio_flat, quality=quality_flat)
+            if physio_features is not None:
+                physio_flat = physio_features.reshape(batch_size * num_windows, -1)
+            else:
+                physio_flat = None
+            fused_flat = self._encode_fused(
+                wf_flat, bio_flat, quality=quality_flat, physio_features=physio_flat,
+            )
             project_dim = fused_flat.shape[-1]
             fused_seq = fused_flat.reshape(batch_size, num_windows, project_dim)
             fused = self._apply_temporal(fused_seq)
             return self._predict_from_fused(fused)
 
-        fused = self._encode_fused(waveform, biosignals, quality=quality)
+        fused = self._encode_fused(
+            waveform, biosignals, quality=quality, physio_features=physio_features,
+        )
         if self.inter_window_temporal is not None:
             fused = self._apply_temporal(fused.unsqueeze(1))
         return self._predict_from_fused(fused)

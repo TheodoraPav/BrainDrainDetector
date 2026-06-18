@@ -74,6 +74,10 @@ model:
   # false -> one BiGRU on all 6 channels (default)
   # true  -> separate BiGRU for E4 and EEG, then concat (64+64 -> 256-d when hidden_size=128)
   dual_tower_biosignal: false
+  # Biosignal encoder: "bigru" (sequence) | "feature_mlp" (hand-crafted features + MLP)
+  physio_encoder: "bigru"
+  physio_feature_dim: 15
+  feature_mlp_dropout: 0.1
   # Options when dual_tower_biosignal: true
   dual_tower:
     # "concat" (legacy) — concatenate tower outputs before audio fusion

@@ -16,7 +16,8 @@ Legacy Empatica export (single column, no header):
   row 0 = Unix start (seconds), row 1 = sample rate, row 2+ = values.
 
 Output: data_processed/physio/P{N}_sec{T}.pt
-  Each .pt file is a dict: {"biosignals": tensor(time_steps, 6), "participant": "P1", "seconds": 5}
+  Each .pt file is a dict: {"biosignals": tensor(time_steps, 6), "physio_features": tensor(15,),
+                           "participant": "P1", "seconds": 5}
   Channel order: [EDA, HR, IBI, theta, alpha, beta]
 
 Usage:
@@ -34,6 +35,7 @@ from scipy.interpolate import interp1d
 import sys
 sys.path.insert(0, str(Path(__file__).parent))
 from utils.pipeline_log import format_count_summary, log_participant_counts, log_stats, stage_ok, stage_start
+from utils.physio_features import PHYSIO_FEATURE_DIM, extract_physio_features
 
 
 def find_subjects_csv(data_raw: Path) -> Path | None:
@@ -403,13 +405,30 @@ def main(cfg):
         if norm_scope == "per_participant" and windows:
             norm_mean, norm_std = compute_participant_norm_stats(windows)
 
+        if norm_scope == "per_participant" and windows:
+            norm_mean, norm_std = compute_participant_norm_stats(windows)
+            raw_features = np.stack([
+                extract_physio_features(w["biosignals"]) for w in windows
+            ])
+            feat_mean = raw_features.mean(axis=0)
+            feat_std = raw_features.std(axis=0)
+            feat_std[feat_std < 1e-6] = 1.0
+        else:
+            feat_mean = feat_std = None
+
         for window_dict in windows:
+            raw_biosignals = window_dict["biosignals"]
+            physio_features = torch.from_numpy(extract_physio_features(raw_biosignals))
+            if feat_mean is not None:
+                physio_features = (physio_features - torch.from_numpy(feat_mean)) / torch.from_numpy(feat_std)
+
             if norm_scope == "per_participant":
-                biosignals = apply_norm_stats(window_dict["biosignals"], norm_mean, norm_std)
+                biosignals = apply_norm_stats(raw_biosignals, norm_mean, norm_std)
             else:
-                biosignals = z_score_normalize(window_dict["biosignals"])
+                biosignals = z_score_normalize(raw_biosignals)
             save_dict = {
                 "biosignals": biosignals,
+                "physio_features": physio_features,
                 "participant": participant_id,
                 "seconds": window_dict["seconds"],
             }
@@ -424,6 +443,7 @@ def main(cfg):
         "participants_skipped": len(skipped_participants),
         "total_windows": total_windows,
         "physio_normalization": norm_scope,
+        "physio_feature_dim": PHYSIO_FEATURE_DIM,
         "windows_per_participant": format_count_summary(counts_by_participant.values()),
         "output_dir": str(output_dir),
     })
