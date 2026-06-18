@@ -113,7 +113,7 @@ class CrossAttentionFusion(nn.Module):
 
         q_norm: torch.Tensor | None = None
         if self.quality_aware and quality is not None:
-            q_norm = quality.clamp(min=1e-3)
+            q_norm = quality.clamp(min=1e-3).to(dtype=query.dtype, device=query.device)
             query = self._scale_by_quality(query, q_norm[:, 0:1])
             key = self._scale_by_quality(key, q_norm[:, 1:2])
 

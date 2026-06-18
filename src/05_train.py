@@ -237,10 +237,39 @@ def _cross_attn_quality_supervision_loss(
     audio_trust: torch.Tensor,
     quality_target: torch.Tensor,
 ) -> torch.Tensor:
+    target = quality_target.to(dtype=audio_trust.dtype, device=audio_trust.device)
     return nn.functional.mse_loss(
         audio_trust.squeeze(-1),
-        quality_target.squeeze(-1),
+        target.squeeze(-1),
     )
+
+
+def _add_fusion_auxiliary_losses(
+    model,
+    loss: torch.Tensor,
+    *,
+    is_training: bool,
+    gmu_gate_reg_lambda: float,
+    cross_attn_quality_lambda: float,
+) -> torch.Tensor:
+    """Auxiliary fusion losses must stay in the same dtype graph as the main loss (AMP-safe)."""
+    if not is_training:
+        return loss
+
+    if gmu_gate_reg_lambda > 0.0:
+        gate_z = getattr(getattr(model, "fusion", None), "last_gate_z", None)
+        if gate_z is not None:
+            loss = loss + gmu_gate_reg_lambda * _gmu_gate_regularization(gate_z)
+
+    if cross_attn_quality_lambda > 0.0:
+        fusion = getattr(model, "fusion", None)
+        audio_trust = getattr(fusion, "last_audio_trust", None)
+        quality_target = getattr(fusion, "last_quality_target", None)
+        if audio_trust is not None and quality_target is not None:
+            loss = loss + cross_attn_quality_lambda * _cross_attn_quality_supervision_loss(
+                audio_trust, quality_target,
+            )
+    return loss
 
 
 def _resolve_va_loss_settings(cfg) -> dict:
@@ -543,24 +572,24 @@ def run_one_epoch(
             if amp_enabled:
                 with torch.amp.autocast("cuda"):
                     output = model(waveform, biosignals, quality=quality)
-                    loss   = criterion(output, targets)
+                    loss = criterion(output, targets)
+                    loss = _add_fusion_auxiliary_losses(
+                        model,
+                        loss,
+                        is_training=is_training,
+                        gmu_gate_reg_lambda=gmu_gate_reg_lambda,
+                        cross_attn_quality_lambda=cross_attn_quality_lambda,
+                    )
             else:
                 output = model(waveform, biosignals, quality=quality)
-                loss   = criterion(output, targets)
-
-            if is_training and gmu_gate_reg_lambda > 0.0:
-                gate_z = getattr(getattr(model, "fusion", None), "last_gate_z", None)
-                if gate_z is not None:
-                    loss = loss + gmu_gate_reg_lambda * _gmu_gate_regularization(gate_z)
-
-            if is_training and cross_attn_quality_lambda > 0.0:
-                fusion = getattr(model, "fusion", None)
-                audio_trust = getattr(fusion, "last_audio_trust", None)
-                quality_target = getattr(fusion, "last_quality_target", None)
-                if audio_trust is not None and quality_target is not None:
-                    loss = loss + cross_attn_quality_lambda * _cross_attn_quality_supervision_loss(
-                        audio_trust, quality_target,
-                    )
+                loss = criterion(output, targets)
+                loss = _add_fusion_auxiliary_losses(
+                    model,
+                    loss,
+                    is_training=is_training,
+                    gmu_gate_reg_lambda=gmu_gate_reg_lambda,
+                    cross_attn_quality_lambda=cross_attn_quality_lambda,
+                )
 
             if is_training:
                 optimizer.zero_grad(set_to_none=True)
