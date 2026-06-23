@@ -1,8 +1,23 @@
-# BrainDrainDetector
+# BrainDrainDetector: Multimodal Cognitive Overload Detection
 
-Multimodal detection of cognitive overload and socioemotional stress using the K-EmoCon dataset.
+**M.Sc. Artificial Intelligence Project**  
+*Authors: Theodora Pavlidou, Marilena Papasideri*
+
+Multimodal detection of cognitive overload and socioemotional stress during dyadic debates using the K-EmoCon dataset.
 
 Each 5-second window of a conversation is classified as **Safe (0)** or **Alarm (1)** based on self-reported arousal and valence. The system fuses audio (Wav2Vec2), E4 wristband physiological signals (EDA, HR, IBI), and NeuroSky EEG (θ, α, β).
+
+## Table of Contents
+- [Labels](#labels)
+- [Architecture](#architecture)
+- [Dataset](#dataset)
+- [Project Structure](#project-structure)
+- [Running the Pipeline](#running-the-pipeline)
+- [Experiments and Results](#experiments-and-results)
+- [Modality Overlap Analysis](#modality-overlap-analysis)
+- [Key Findings](#key-findings)
+- [Evaluation](#evaluation)
+- [Setup](#setup)
 
 ---
 
@@ -22,7 +37,7 @@ Class distribution after filtering: ~83% Safe, ~17% Alarm (1,492 total windows, 
 ## Architecture
 
 - **Audio encoder:** Wav2Vec 2.0, pretrained, **frozen** during training. Fixed feature extractor.
-- **Biosignal encoder:** Bidirectional GRU (h=128). Input: 50×6 tensor (5 s window, 6 channels).
+- **Biosignal encoder:** Bidirectional GRU (h=128). Input: 50×6 tensor (5 s window, 6 channels). Signals are **z-score normalized per window**.
 - **Fusion:** configurable via `model.fusion_mode`. See table below.
 - **Head:** fully connected, 2 logits, CrossEntropyLoss with class weights.
 
@@ -30,7 +45,9 @@ Class distribution after filtering: ~83% Safe, ~17% Alarm (1,492 total windows, 
 
 | `fusion_mode` | Description |
 |---------------|-------------|
-| `cross_attn_pooled` (default) | Audio and pooled biosignal token in 256-d space, MultiHeadAttention with seq_len=1. Lightweight. |
+| `cross_attn_pooled` (default) | Audio and pooled biosignal token in 256-d space, MultiHeadAttention with seq_len=1. Audio-anchored residual. |
+| `balanced_cross_attn` | Addresses audio bias by learning weights ($w_a, w_b$) for a balanced residual, combined with 15% modality dropout. |
+| `quality_aware_cross_attn` | Injects biosignal quality indices (BQI) into the attention mechanism to penalize noisy physiological tokens. |
 | `sequence_cross_attn` | Audio (Q, 1 token) attends over full BiGRU output sequence (K/V, 50 biosignal tokens). Real temporal attention weights. |
 | `gated_multimodal_unit` | Gate z = sigmoid(W·concat(a,b)) mixes audio and biosignal embeddings per feature. Dynamic modality contribution. |
 
@@ -104,8 +121,9 @@ All runs use `cross_attn_pooled` fusion.
 |---------|----------|--------------|----------|
 | BiGRU h=128 (default) | **59.5%** | **51.2%** | **56.0%** |
 | BiGRU + inter-window GRU×5 | 53.16% | 29.2% | 40.28% |
-| BiGRU + inter-window LSTM×5 | lower | lower | lower |
+| Hand-crafted feature MLP | 49.63% | 23.4% | 33.96% |
 | 1D CNN front-end | 46.16% | 20.8% | 29.84% |
+| BiGRU + inter-window LSTM×5 | 45.25% | 18.4% | 27.34% |
 
 Simple BiGRU wins. CNN overfits. Inter-window temporal models find no useful pattern across consecutive 5-second windows.
 
@@ -116,6 +134,8 @@ Simple BiGRU wins. CNN overfits. Inter-window temporal models find no useful pat
 | Cross-attn pooled | **59.5%** | **51.2%** | **56.0%** |
 | Cross-attn sequence | 56.19% | 43.4% | 50.23% |
 | GMU | 46.97% | 21.2% | 30.64% |
+| Quality-aware cross-attn | 41.16% | 11.6% | 18.74% |
+| Balanced cross-attn | 40.45% | 12.0% | 18.84% |
 
 GMU underperforms: the gate collapses toward audio and the biosignal branch is not used effectively on this small noisy dataset.
 
@@ -228,7 +248,8 @@ The fusion is heavily audio-biased. There is more interference than synergy — 
 ## Setup
 
 ```powershell
-cd "c:\Users\theod\Desktop\Master\2ο εξάμηνο\Deep Learning\BrainDrainDetector"
+git clone https://github.com/TheodoraPav/BrainDrainDetector.git
+cd BrainDrainDetector
 
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
