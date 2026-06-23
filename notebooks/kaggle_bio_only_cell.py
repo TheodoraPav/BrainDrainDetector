@@ -1,16 +1,58 @@
-# ========== BrainDrainDetector — Kaggle one-cell PIPELINE (v11) ==========
-# Dataset: BrainDrainDataset (slug on Kaggle: braindraindataset)
+# ========== BrainDrainDetector — Kaggle ONE CELL: BIO-ONLY ==========
 #
-# Notebook setup:
-#   1. Settings → Accelerator: GPU T4 x1, Internet: On
-#   2. Add-ons → Secrets → label HF_TOKEN → Add to notebook (not only "saved")
-#      Kaggle does NOT put secrets in os.environ — use UserSecretsClient (see below)
-#   3. Add Data → search "BrainDrainDataset" (your private K EmoCon upload)
-#   4. Paste this entire file into one code cell and run
+# Single run → pooled baseline trained with audio embedding zeroed (bio_only).
+# Fair settings: cross_attn_pooled | macro_f1 | batch 8 | patience 8 |
+# weighted CE | balanced sampling | no aug
 #
-# Expected mount (either layout works):
-#   /kaggle/input/braindraindataset/emotion_annotations/...
-#   /kaggle/input/braindraindataset/Data/emotion_annotations/...   (if you zipped the Data/ folder)
+# ── Kaggle notebook setup ───────────────────────────────────────────────────
+#   1. GPU T4 x1, Internet ON, HF_TOKEN secret, BrainDrainDataset attached
+#   2. Push GitHub master BEFORE Run (needs model.input_modality in classifier.py)
+#   3. Paste this entire file into ONE code cell and Run (~2–3 h)
+#
+# Output zip:
+#   results_classification_cross_attn_pooled_bio_only_weighted_no_aug.zip
+#
+# ── Hugging Face model access (accept once in browser, same HF account as token) ──
+#   https://huggingface.co/pyannote/speaker-diarization-3.1
+#   https://huggingface.co/pyannote/segmentation-3.0
+#   https://huggingface.co/pyannote/wespeaker-voxceleb-resnet34-LM
+#   https://huggingface.co/pyannote/voice-activity-detection
+#   https://huggingface.co/pyannote/segmentation
+#
+# ── GitHub: push master BEFORE Run (cell clones GIT_URL / GIT_BRANCH) ──
+#
+# FORCE_RERUN_STEPS: leave [] → auto ["05","06"] (reuse seeded audio/physio)
+#   offline_aug preset → ["04","05","06"] (rebuild windows_aug + retrain)
+#
+# ── Expected dataset layout (your Kaggle mount) ───────────────────────────────
+#   kemocon_root = /kaggle/input/datasets/theodorapavlidou/braindraindataset/
+#
+#   Raw physio (numeric folder names → mapped to P1, P2, ... in step 03):
+#     .../e4_data/e4_data/1/E4_EDA.csv          (columns: timestamp,value in ms)
+#     .../neurosky_polar_data/neurosky_polar_data/1/BrainWave.csv
+#     .../metadata/metadata/subjects.csv        (debate start/end per pid — upload to Kaggle dataset)
+#
+#   Preprocessed seed (diarization only — step 02 re-runs VAD + windows, skips pyannote):
+#     .../data_processed/data_processed/audio_diarization/p1.p2/segments.csv
+#   Do NOT upload audio/*.pt if you want fresh VAD windows each run.
+#
+#   Trained checkpoints (recover step 05 without 3h retrain):
+#     .../checkpoints/best_P1.pt ... best_P27.pt
+#
+# ── Timing (rough, GPU) ─────────────────────────────────────────────────────
+#   Step 2 audio: ~3-4h first run (pyannote diarization) | ~15-30min with cached diarization
+#   Steps 1,3,4: minutes each
+#   Step 5 LOSO: 27 folds × up to EPOCHS (~2-4h with embedding cache)
+#
+# ── Success markers in logs (look for these) ────────────────────────────────
+#   [STEP 01 OK] ... [STEP 06 OK] at the end of each pipeline script
+#
+# ── Outputs (persist until session ends; save as Kaggle Output if needed) ───
+#   /kaggle/working/data_processed/
+#   /kaggle/working/checkpoints/
+#   /kaggle/working/figures/
+#
+# Paste into a NEW cell below Cell 1 (or alone if dataset has seeded audio+physio).
 
 import gc
 import os
@@ -23,64 +65,66 @@ from huggingface_hub import login
 from omegaconf import OmegaConf
 
 # =============================================================================
-# USER SETTINGS — edit only this block
+# USER SETTINGS — bio-only (do not change unless you know why)
 # =============================================================================
-CELL_VERSION = "2026-06-04-v21-classify-sequence-cross-attn"  # printed at run — if missing in log, paste latest cell
-print(f"BrainDrainDetector Kaggle cell {CELL_VERSION}")
+INPUT_MODALITY = "bio_only"
+ZIP_OUTPUT_NAME = "results_classification_cross_attn_pooled_bio_only_weighted_no_aug.zip"
 
-WORKING_ROOT = Path("/kaggle/working")
-REPO = WORKING_ROOT / "BrainDrainDetector"
-run_config_copy = WORKING_ROOT / "kaggle_run_config.yaml"
+CELL_VERSION = "2026-06-11-bio-only-macro-f1"
+print(f"BrainDrainDetector Kaggle bio-only cell {CELL_VERSION}")
+print(f"[Kaggle] input_modality={INPUT_MODALITY} | zip={ZIP_OUTPUT_NAME}")
+
+REPO = Path("/kaggle/working/BrainDrainDetector")
 GIT_URL = "https://github.com/TheodoraPav/BrainDrainDetector.git"
 GIT_BRANCH = "master"  # branch with your latest pushed code
 
 KAGGLE_DATASET_SLUG = "braindraindataset"
 
-# Baseline experiment knobs (keep as-is for simplest classification run)
-TASK_MODE = "classification"        # "classification" | "regression_va"
-FUSION_MODE = "concat_fusion"   # "cross_attn_pooled" | "sequence_cross_attn" | "concat_fusion"
-AUGMENTATION_ENABLED = False        # no augmentation
+# =============================================================================
+# BASELINE — cross_attn_pooled, single BiGRU, weighted CE, no aug
+# Change ONE ablation knob per run; keep training settings identical.
+# =============================================================================
+FUSION_MODE = "cross_attn_pooled"   # ablation: "sequence_cross_attn"
+AUGMENTATION_ENABLED = False        # ablation: True
 
-# 1D CNN before BiGRU on physio (~50 steps inside each 5 s window).
-PHYSIO_CNN_ENABLED = False
+DUAL_TOWER_BIOSIGNAL = False        # ablation: True  (separate BiGRU for E4 + EEG)
+PHYSIO_CNN_ENABLED = False          # ablation: True
 PHYSIO_CNN_OUT_CHANNELS = 32
 PHYSIO_CNN_KERNEL_SIZE = 5
 
-EPOCHS = 50          # LOSO = 27 separate models, each up to EPOCHS (not 27× per global epoch)
-EARLY_STOPPING_PATIENCE = 8   # 0 = always run all EPOCHS; saves GPU when val F1 plateaus
-CACHE_AUDIO_EMBEDDINGS = True   # one Wav2Vec2 pass per window, then train on 768-d vectors
-DROP_WAVEFORM_AFTER_CACHE = True  # free ~0.5 GB RAM (safe with frozen wav2vec2)
-USE_AMP = True                  # mixed precision on GPU
-BATCH_SIZE = 8       # with embedding cache you can often raise batch (try 4 if OOM)
-RUN_EXPLAIN = True  # True → also run 07_explain.py (slow)
+TEMPORAL_MODE = None                # ablation: "gru" | "lstm"
+TEMPORAL_NUM_WINDOWS = 5
+TEMPORAL_HIDDEN_SIZE = 128
 
-# Skip preprocessing if outputs already exist in /kaggle/working/data_processed/
+# Keep fixed across ablations (fair comparison) — overridden by preset pooled_unweighted
+WEIGHTED_LOSS = True
+BALANCED_SAMPLING = True
+SELECTION_METRIC = "macro_f1"
+EPOCHS = 50
+EARLY_STOPPING_PATIENCE = 8
+EARLY_STOPPING_MIN_EPOCHS = 5
+BATCH_SIZE = 8
+CACHE_AUDIO_EMBEDDINGS = True
+DROP_WAVEFORM_AFTER_CACHE = True
+USE_AMP = True
+RUN_EXPLAIN = False
+
+SAVE_RESULTS_ZIP = True
+
 SKIP_IF_EXISTS = True
 
-# Copy preprocessed artifacts from dataset zip (slow steps only by default).
 SEED_FROM_DATASET = True
-# Folders copied from dataset → /kaggle/working/data_processed/
-# Keep only expensive preprocessing; omit windows/labels so steps 01+04 always rebuild.
 SEED_DATASET_FOLDERS = ["audio", "audio_diarization", "physio"]
-SEED_DATASET_CSVS: list[str] = []   # e.g. never seed labels.csv — step 01 writes labels + annotations
+SEED_DATASET_CSVS: list[str] = []
 
-SEED_CHECKPOINTS_FROM_DATASET = False  # True only for recovery without retraining step 05
+SEED_CHECKPOINTS_FROM_DATASET = False
 
-# Recovery run (checkpoints on dataset, no loso_results.pt yet):
-#   FORCE_RERUN_STEPS = ["05", "06"]
-# VA / fresh tensors (default when TASK_MODE=regression_va — auto-filled below if empty):
-#   FORCE_RERUN_STEPS = ["01", "04", "05", "06"]
-FORCE_RERUN_STEPS: list[str] = ["03", "04", "05", "06"]
-
-# Auto force-rerun steps that must be rebuilt for the active task (when FORCE_RERUN_STEPS is empty)
-AUTO_FORCE_RERUN_FOR_TASK = True
+FORCE_RERUN_STEPS: list[str] = ["05", "06"]
+AUTO_FORCE_RERUN = False
 # =============================================================================
 
-if AUTO_FORCE_RERUN_FOR_TASK and not FORCE_RERUN_STEPS:
-    if TASK_MODE == "regression_va":
-        FORCE_RERUN_STEPS = ["01", "04", "05", "06"]
-    else:
-        FORCE_RERUN_STEPS = ["05", "06"]
+TASK_MODE = "classification"
+VALID_INPUT_MODALITIES = frozenset({"full", "audio_only", "bio_only"})
 
 
 # -------------------------
@@ -157,6 +201,11 @@ if DATASET_PROCESSED.is_dir():
     print("  audio_diarization/ exists:", (DATASET_PROCESSED / "audio_diarization").is_dir())
     diar_sample = DATASET_PROCESSED / "audio_diarization" / "p1.p2" / "segments.csv"
     print("  diarization sample exists:", diar_sample.is_file(), f"({diar_sample})")
+    if (DATASET_PROCESSED / "audio_diarization").is_dir():
+        n_seg = len(list((DATASET_PROCESSED / "audio_diarization").glob("*/segments.csv")))
+        n_audio_ds = len(list((DATASET_PROCESSED / "audio").glob("*.pt"))) if (DATASET_PROCESSED / "audio").is_dir() else 0
+        print(f"  segments.csv debates: {n_seg}/{N_DEBATES}")
+        print(f"  audio .pt files: {n_audio_ds}")
 else:
     fallback = kemocon_root / "data_processed"
     print(f"  (fallback single data_processed exists: {fallback.is_dir()})")
@@ -372,7 +421,7 @@ os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
 # -------------------------
 # 3) Build Kaggle config
 # -------------------------
-def load_baseline_cfg() -> OmegaConf:
+def load_experiment_cfg() -> OmegaConf:
     base = OmegaConf.load(REPO / "configs/base.yaml")
     exp_path = REPO / "configs/exp_baseline.yaml"
     if exp_path.is_file():
@@ -385,52 +434,74 @@ def load_baseline_cfg() -> OmegaConf:
     return cfg
 
 
-cfg = load_baseline_cfg()
-cfg.paths.data_raw = str(kemocon_root)
-cfg.paths.data_processed = "/kaggle/working/data_processed"
-cfg.paths.checkpoints = "/kaggle/working/checkpoints"
-cfg.paths.figures = "/kaggle/working/figures"
-cfg.training.epochs = int(EPOCHS)
-cfg.training.batch_size = int(BATCH_SIZE)
-cfg.training.balanced_sampling = True
-cfg.training.early_stopping_patience = int(EARLY_STOPPING_PATIENCE)
-cfg.training.early_stopping_min_epochs = 5
-cfg.training.cache_audio_embeddings = bool(CACHE_AUDIO_EMBEDDINGS)
-cfg.training.drop_waveform_after_embedding_cache = bool(DROP_WAVEFORM_AFTER_CACHE)
-cfg.training.use_amp = bool(USE_AMP)
-cfg.task.mode = TASK_MODE
-cfg.model.fusion_mode = FUSION_MODE
-cfg.model.freeze_audio_backbone = True
-cfg.model.physio_cnn.enabled = bool(PHYSIO_CNN_ENABLED)
-cfg.model.physio_cnn.out_channels = int(PHYSIO_CNN_OUT_CHANNELS)
-cfg.model.physio_cnn.kernel_size = int(PHYSIO_CNN_KERNEL_SIZE)
-cfg.augmentation.enabled = bool(AUGMENTATION_ENABLED)
+cfg = load_experiment_cfg()
+WORKING_ROOT = Path("/kaggle/working")
+run_config_copy = WORKING_ROOT / "kaggle_run_config.yaml"
+cfg_path = REPO / "configs/exp_baseline_kaggle.yaml"
+WORKING_ROOT.mkdir(parents=True, exist_ok=True)
 
-# Align selection_metric to task mode
-if TASK_MODE == "regression_va":
-    cfg.training.selection_metric = "ccc_mean"
-else:
-    cfg.training.selection_metric = "macro_f1"
 
-cfg_path = REPO / f"configs/kaggle_{TASK_MODE}_{FUSION_MODE}.yaml"
-OmegaConf.save(cfg, cfg_path)
-shutil.copy2(cfg_path, run_config_copy)
-print("Config:", cfg_path)
-print("  task_mode:", cfg.task.mode)
-print("  fusion_mode:", cfg.model.fusion_mode)
-print(
-    "  physio_cnn:",
-    cfg.model.physio_cnn.enabled,
-    f"(out={cfg.model.physio_cnn.out_channels}, kernel={cfg.model.physio_cnn.kernel_size})",
-)
-print("  augmentation:", cfg.augmentation.enabled)
-print("  selection_metric:", cfg.training.selection_metric)
-print("  epochs:", cfg.training.epochs, "| batch_size:", cfg.training.batch_size)
-print("  early_stopping_patience:", cfg.training.early_stopping_patience)
-print("  cache_audio_embeddings:", cfg.training.cache_audio_embeddings)
-print("  drop_waveform_after_cache:", cfg.training.drop_waveform_after_embedding_cache, "| use_amp:", cfg.training.use_amp)
-print("  seed_folders:", SEED_DATASET_FOLDERS)
-print("  force_rerun_steps:", FORCE_RERUN_STEPS)
+def apply_run_config(input_modality: str) -> None:
+    """Build OmegaConf for the active modality run and save YAML copies."""
+    global cfg
+
+    if input_modality not in VALID_INPUT_MODALITIES:
+        raise ValueError(f"input_modality must be one of {sorted(VALID_INPUT_MODALITIES)}; got {input_modality!r}")
+    cfg = load_experiment_cfg()
+    cfg.paths.data_raw = str(kemocon_root)
+    cfg.paths.data_processed = "/kaggle/working/data_processed"
+    cfg.paths.checkpoints = "/kaggle/working/checkpoints"
+    cfg.paths.figures = "/kaggle/working/figures"
+    cfg.training.epochs = int(EPOCHS)
+    cfg.training.batch_size = int(BATCH_SIZE)
+    cfg.training.balanced_sampling = bool(BALANCED_SAMPLING)
+    cfg.training.weighted_loss = bool(WEIGHTED_LOSS)
+    cfg.training.early_stopping_patience = int(EARLY_STOPPING_PATIENCE)
+    cfg.training.early_stopping_min_epochs = int(EARLY_STOPPING_MIN_EPOCHS)
+    cfg.training.selection_metric = str(SELECTION_METRIC)
+    cfg.training.cache_audio_embeddings = bool(CACHE_AUDIO_EMBEDDINGS)
+    cfg.training.drop_waveform_after_embedding_cache = bool(DROP_WAVEFORM_AFTER_CACHE)
+    cfg.training.use_amp = bool(USE_AMP)
+    cfg.task.mode = TASK_MODE
+    cfg.task.store_raw_av_in_tensors = True
+    cfg.task.derived_binary_eval = True
+    cfg.model.fusion_mode = FUSION_MODE
+    cfg.model.input_modality = str(input_modality)
+    cfg.model.freeze_audio_backbone = True
+    cfg.model.dual_tower_biosignal = bool(DUAL_TOWER_BIOSIGNAL)
+    cfg.model.physio_cnn.enabled = bool(PHYSIO_CNN_ENABLED)
+    cfg.model.physio_cnn.out_channels = int(PHYSIO_CNN_OUT_CHANNELS)
+    cfg.model.physio_cnn.kernel_size = int(PHYSIO_CNN_KERNEL_SIZE)
+    if not hasattr(cfg.model, "temporal") or cfg.model.temporal is None:
+        cfg.model.temporal = OmegaConf.create({})
+    _temporal = str(TEMPORAL_MODE).lower() if TEMPORAL_MODE is not None else "none"
+    if _temporal in ("none", "", "off", "null"):
+        cfg.model.temporal.enabled = False
+        cfg.model.temporal.type = "none"
+    elif _temporal in ("gru", "lstm"):
+        cfg.model.temporal.enabled = True
+        cfg.model.temporal.type = _temporal
+        cfg.model.temporal.num_windows = int(TEMPORAL_NUM_WINDOWS)
+        cfg.model.temporal.hidden_size = int(TEMPORAL_HIDDEN_SIZE)
+        cfg.model.temporal.num_layers = 1
+        cfg.model.temporal.bidirectional = False
+    else:
+        raise ValueError(f"TEMPORAL_MODE must be None, 'gru', or 'lstm'; got {TEMPORAL_MODE!r}")
+    cfg.augmentation.enabled = bool(AUGMENTATION_ENABLED)
+
+    OmegaConf.save(cfg, cfg_path)
+    OmegaConf.save(cfg, run_config_copy)
+
+    print("Config:", cfg_path)
+    print("  input_modality:", cfg.model.input_modality)
+    print("  fusion_mode:", cfg.model.fusion_mode)
+    print("  weighted_loss:", cfg.training.get("weighted_loss", True))
+    print("  balanced_sampling:", cfg.training.get("balanced_sampling", True))
+    print("  selection_metric:", cfg.training.selection_metric)
+    print("  force_rerun_steps:", FORCE_RERUN_STEPS)
+
+
+apply_run_config(INPUT_MODALITY)
 
 
 # -------------------------
@@ -451,7 +522,6 @@ def find_preprocessed_bundle() -> Path | None:
 
     # Ordered: nested data_processed/data_processed first (your upload layout)
     candidates: list[Path] = [
-        input_root / KAGGLE_DATASET_SLUG / "data_processed",  # sibling directory path
         kemocon_root / "data_processed" / "data_processed",
         input_root / "datasets" / "theodorapavlidou" / KAGGLE_DATASET_SLUG / "data_processed" / "data_processed",
         kemocon_root / "data_processed",  # flat fallback
@@ -480,9 +550,10 @@ def seed_working_from_dataset(bundle: Path) -> dict[str, int]:
     """
     Copy selected preprocessed artifacts from the dataset zip into working storage.
 
-    Only folders listed in SEED_DATASET_FOLDERS are copied (default: slow audio/physio).
-    windows/, windows_aug/, and labels.csv are intentionally omitted so steps 01 and 04
-    rebuild tensors with annotations (arousal/valence) for regression_va.
+    Default SEED_DATASET_FOLDERS = ["audio_diarization", "physio"]:
+      - audio_diarization/  → skip pyannote (~3-4h), step 02 uses segments.csv cache
+      - physio/             → skip step 03
+    Not seeded (rebuilt each run): audio/, windows/, labels.csv, annotations.csv
     """
     PROCESSED.mkdir(parents=True, exist_ok=True)
     copied: dict[str, int] = {}
@@ -506,7 +577,7 @@ def seed_working_from_dataset(bundle: Path) -> dict[str, int]:
             shutil.copy2(src, PROCESSED / fname)
             copied[fname] = 1
 
-    skipped = {"windows", "windows_aug", "labels.csv", "annotations.csv"} - set(SEED_DATASET_FOLDERS) - set(SEED_DATASET_CSVS)
+    skipped = {"audio", "windows", "windows_aug", "labels.csv", "annotations.csv"} - set(SEED_DATASET_FOLDERS) - set(SEED_DATASET_CSVS)
     if skipped:
         present = [name for name in sorted(skipped) if (bundle / name).exists()]
         if present:
@@ -592,8 +663,13 @@ if SEED_FROM_DATASET:
         print(f"[Kaggle] After seed: audio_windows={n_audio} diarized_debates={n_diar}/{N_DEBATES}")
         if n_diar >= N_DEBATES and n_audio == 0:
             print(
-                "[Kaggle] WARNING: diarization segments found but no audio/*.pt in dataset. "
-                "Upload data_processed/.../audio/ too to skip step 02."
+                "[Kaggle] Diarization cached — step 02 will run VAD + 5s windows only "
+                "(no pyannote, ~15-30 min)."
+            )
+        elif n_diar >= N_DEBATES and n_audio > 0:
+            print(
+                "[Kaggle] Note: audio/*.pt also present in working dir — "
+                "set FORCE_RERUN_STEPS=['02', ...] to rebuild windows from cached diarization."
             )
     else:
         print("[Kaggle] No preprocessed bundle with audio_diarization/segments.csv in dataset.")
@@ -610,19 +686,42 @@ if SEED_CHECKPOINTS_FROM_DATASET:
         print(f"[Kaggle] Checked primary path: {DATASET_CHECKPOINTS}")
 
 
+def _prepare_force_rerun_artifacts() -> None:
+    """Drop stale loso_results / checkpoints / figures before a forced 05 or 06 rerun."""
+    if "05" in FORCE_RERUN_STEPS:
+        for name in ("loso_results.pt",):
+            p = PROCESSED / name
+            if p.is_file():
+                print(f"[Kaggle] FORCE 05: removing {p.name}")
+                p.unlink()
+        ckpt_dir = Path(cfg.paths.checkpoints)
+        if ckpt_dir.is_dir():
+            removed = 0
+            for ckpt in ckpt_dir.glob("best_*.pt"):
+                ckpt.unlink()
+                removed += 1
+            if removed:
+                print(f"[Kaggle] FORCE 05: removed {removed} stale checkpoint(s) from {ckpt_dir}")
+
+    if "06" in FORCE_RERUN_STEPS:
+        fig_dir = Path(cfg.paths.figures)
+        if fig_dir.is_dir():
+            shutil.rmtree(fig_dir)
+            print(f"[Kaggle] FORCE 06: cleared {fig_dir}")
+        fig_dir.mkdir(parents=True, exist_ok=True)
+
+
+_prepare_force_rerun_artifacts()
+
+
 def step_is_done(step: str) -> bool:
     """Return True when this pipeline step's outputs already exist and match the active task."""
     if step == "01":
-        labels_ok = (PROCESSED / "labels.csv").is_file()
-        if cfg.task.mode == "regression_va":
-            # Step 01 must also produce annotations.csv (raw arousal/valence).
-            return labels_ok and (PROCESSED / "annotations.csv").is_file()
-        return labels_ok
+        return (PROCESSED / "labels.csv").is_file()
 
     if step == "02":
         n_audio = _count_files(PROCESSED / "audio", "*.pt")
         n_diar = _count_files(PROCESSED / "audio_diarization", "*/segments.csv")
-        # Require all debates diarized AND at least some windows saved
         return n_audio > 0 and n_diar >= N_DEBATES
 
     if step == "03":
@@ -630,11 +729,7 @@ def step_is_done(step: str) -> bool:
 
     if step == "04":
         windows_dir = PROCESSED / ("windows_aug" if cfg.augmentation.enabled else "windows")
-        if _count_files(windows_dir, "*.pt") == 0:
-            return False
-        if cfg.task.mode == "regression_va":
-            return _window_tensors_have_av(windows_dir)
-        return True
+        return _count_files(windows_dir, "*.pt") > 0
 
     if step == "05":
         results = PROCESSED / "loso_results.pt"
@@ -646,9 +741,7 @@ def step_is_done(step: str) -> bool:
         if not folds:
             return False
         first = folds[0]
-        if cfg.task.mode == "regression_va":
-            return "true_arousal" in first and "pred_arousal" in first
-        return "true_labels" in first and "pred_labels" in first
+        return "true_labels" in first and "pred_labels" in first and "recall_alarm" in first
 
     if step == "06":
         return _count_files(Path(cfg.paths.figures), "*.png") > 0
@@ -723,108 +816,39 @@ def run_step(script: str, step_id: str, extra=None) -> None:
 
 
 # -------------------------
-# 5) Pipeline
+# 5) Zip helpers + summary (before main runs)
 # -------------------------
-PIPELINE = [
-    ("01", "01_build_labels.py",       "build labels"),
-    ("02", "02_preprocess_audio.py",   "preprocess audio (diarization + VAD) — SLOW ~3-4h"),
-    ("03", "03_preprocess_physio.py",  "preprocess physio"),
-    ("04", "04_build_tensors.py",      "build joined window tensors"),
-    ("05", "05_train.py",              "LOSO training"),
-    ("06", "06_evaluate.py",           "evaluate + plots"),
-]
-
-for i, (step_id, script, description) in enumerate(PIPELINE, start=1):
-    print("\n" + "=" * 80)
-    print(f"STEP {i}/6 — {description}")
-    print("=" * 80)
-    if step_id == "05":
-        import torch
-
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            free, total = torch.cuda.mem_get_info()
-            print(f"GPU: {torch.cuda.get_device_name(0)}")
-            print(f"GPU mem free: {free / 1e9:.2f} GB / {total / 1e9:.2f} GB")
-        # Drop large objects from earlier steps to free RAM before Wav2Vec2 load
-        if "dataset_bundle" in globals():
-            del dataset_bundle
-        gc.collect()
-    run_step(script, step_id)
-
-if RUN_EXPLAIN:
-    print("\n" + "=" * 80)
-    print("OPTIONAL — attention explainability")
-    print("=" * 80)
-    run_step("07_explain.py", "07", extra=None)  # no skip for explain
-
-
-# -------------------------
-# 6) Final summary
-# -------------------------
-import torch
-
-results_path = PROCESSED / "loso_results.pt"
-if results_path.is_file():
-    data = torch.load(results_path, weights_only=False)
-    print("\n=== LOSO summary (baseline, pooled fusion) ===")
-    for k, v in data["summary"].items():
-        print(f"  {k}: {v}")
-else:
-    print("No results file:", results_path)
-
-print("\nOutputs:")
-print("  data_processed:", cfg.paths.data_processed)
-print("  checkpoints:   ", cfg.paths.checkpoints)
-print("  figures:       ", cfg.paths.figures)
-print("\n[Kaggle] CELL 1 DONE.")
-print("For new experiments (different fusion/aug/epochs) without redoing audio:")
-print("  → use notebooks/kaggle_rerun_experiment_cell.py in a NEW cell")
-
-
-# -------------------------
-# 7) Zip results for download (figures + loso_results.pt)
-# -------------------------
-import zipfile
 import json
-
-SAVE_RESULTS_ZIP = True
-# None → auto name from task / fusion / weighted_loss / augmentation
-ZIP_OUTPUT_NAME: str | None = None
+import zipfile
 
 
-def _build_results_zip_name() -> str:
-    aug = "aug" if cfg.augmentation.enabled else "no_aug"
-    wl = "weighted" if cfg.training.get("weighted_loss", True) else "unweighted"
-    return f"results_{cfg.task.mode}_{cfg.model.fusion_mode}_{wl}_{aug}.zip"
+def _print_loso_summary(path: Path, title: str) -> None:
+    if not path.is_file():
+        print(f"\n=== {title} ===\n  (missing {path.name})")
+        return
+    import torch
+
+    data = torch.load(path, weights_only=False)
+    print(f"\n=== {title} ===")
+    if data.get("task_mode"):
+        print(f"  task_mode: {data['task_mode']}")
+    if data.get("input_modality"):
+        print(f"  input_modality: {data['input_modality']}")
+    for k, v in data.get("summary", {}).items():
+        if isinstance(v, float):
+            print(f"  {k}: {v:.4f}")
+        else:
+            print(f"  {k}: {v}")
 
 
-def _data_processed_artifacts_for_task(task_mode: str) -> list[str]:
-    """Flat filenames under data_processed/ to include in the zip."""
-    common = [
+def _data_processed_artifacts_for_task() -> list[str]:
+    return [
         "loso_results.pt",
         "labels.csv",
         "annotations.csv",
         "threshold_tuning_results.json",
         "threshold_sweep.csv",
     ]
-    if task_mode == "va_separated_classify":
-        return common + [
-            "loso_results_arousal.pt",
-            "loso_results_valence.pt",
-            "hl_evaluation_report_arousal.json",
-            "hl_evaluation_report_valence.json",
-            "derived_alarm_evaluation_report.json",
-            "derived_alarm_per_window.csv",
-        ]
-    if task_mode == "regression_va":
-        return common + [
-            "va_evaluation_report.json",
-            "derived_alarm_evaluation_report.json",
-            "derived_alarm_per_window.csv",
-        ]
-    return common
 
 
 def _figures_zip_arcname(file_path: Path, figures_dir: Path) -> str:
@@ -844,11 +868,6 @@ def zip_run_results(
     extra_files: list[tuple[Path, str]] | None = None,
     required_in_zip: list[str] | None = None,
 ) -> list[str]:
-    """
-    Pack results with fixed top-level folders (figures/, data_processed/, configs/).
-
-    Extract anywhere: unzip → figures/... and data_processed/loso_results.pt
-    """
     zip_path = Path(zip_path)
     figures_dir = Path(figures_dir)
     data_processed_dir = Path(data_processed_dir)
@@ -856,7 +875,6 @@ def zip_run_results(
         zip_path.unlink()
 
     written: list[str] = []
-    task_mode = str(cfg.task.mode)
 
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
         if figures_dir.is_dir():
@@ -868,7 +886,7 @@ def zip_run_results(
         else:
             print(f"[Kaggle] Warning: figures dir not found: {figures_dir}")
 
-        for name in _data_processed_artifacts_for_task(task_mode):
+        for name in _data_processed_artifacts_for_task():
             file_path = data_processed_dir / name
             if file_path.is_file():
                 arc = _data_processed_zip_arcname(name)
@@ -878,8 +896,9 @@ def zip_run_results(
         for src, arc in extra_files or []:
             src = Path(src)
             if src.is_file():
-                zipf.write(src, arc.replace("\\", "/"))
-                written.append(arc.replace("\\", "/"))
+                arc = arc.replace("\\", "/")
+                zipf.write(src, arc)
+                written.append(arc)
 
     if not written:
         raise RuntimeError(
@@ -887,10 +906,7 @@ def zip_run_results(
             "Check that step 05/06 finished and paths exist."
         )
 
-    missing_required = [
-        r for r in (required_in_zip or [])
-        if r not in written
-    ]
+    missing_required = [r for r in (required_in_zip or []) if r not in written]
     if missing_required:
         raise RuntimeError(
             f"[Kaggle] Zip missing required entries: {missing_required}. "
@@ -899,23 +915,57 @@ def zip_run_results(
 
     size_mb = zip_path.stat().st_size / (1024 * 1024)
     print(f"[Kaggle] Zipped {len(written)} file(s) -> {zip_path} ({size_mb:.2f} MB)")
-    print("  Layout: figures/...  data_processed/loso_results.pt  kaggle_run_config.yaml")
     with zipfile.ZipFile(zip_path, "r") as zf:
-        names = zf.namelist()
-        if "data_processed/loso_results.pt" in names:
-            print("  Verified: data_processed/loso_results.pt inside zip")
-        else:
+        if "data_processed/loso_results.pt" not in zf.namelist():
             print("  WARNING: data_processed/loso_results.pt NOT in zip — re-run step 05")
     return written
 
 
+# -------------------------
+# 6) Pipeline — full run (01–06) + zip
+# -------------------------
+PIPELINE = [
+    ("01", "01_build_labels.py",       "build labels"),
+    ("02", "02_preprocess_audio.py",   "preprocess audio (cached diarization + VAD) — ~15-30min"),
+    ("03", "03_preprocess_physio.py",  "preprocess physio"),
+    ("04", "04_build_tensors.py",      "build joined window tensors"),
+    ("05", "05_train.py",              "LOSO training"),
+    ("06", "06_evaluate.py",           "evaluate + plots"),
+]
+
+for i, (step_id, script, description) in enumerate(PIPELINE, start=1):
+    print("\n" + "=" * 80)
+    print(f"STEP {i}/6 — {description}")
+    print("=" * 80)
+    if step_id == "05":
+        import torch
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            free, total_mem = torch.cuda.mem_get_info()
+            print(f"GPU: {torch.cuda.get_device_name(0)}")
+            print(f"GPU mem free: {free / 1e9:.2f} GB / {total_mem / 1e9:.2f} GB")
+        if "dataset_bundle" in globals():
+            del dataset_bundle
+        gc.collect()
+    run_step(script, step_id)
+
+_print_loso_summary(
+    PROCESSED / "loso_results.pt",
+    f"LOSO summary ({INPUT_MODALITY}, {FUSION_MODE})",
+)
+
 if SAVE_RESULTS_ZIP:
-    zip_name = ZIP_OUTPUT_NAME or _build_results_zip_name()
-    zip_out = WORKING_ROOT / zip_name
+    zip_out = WORKING_ROOT / ZIP_OUTPUT_NAME
     manifest = {
         "cell_version": CELL_VERSION,
         "task_mode": TASK_MODE,
+        "input_modality": INPUT_MODALITY,
         "fusion_mode": FUSION_MODE,
+        "selection_metric": SELECTION_METRIC,
+        "weighted_loss": bool(WEIGHTED_LOSS),
+        "balanced_sampling": bool(BALANCED_SAMPLING),
         "force_rerun_steps": FORCE_RERUN_STEPS,
         "seed_folders": SEED_DATASET_FOLDERS,
     }
@@ -933,5 +983,9 @@ if SAVE_RESULTS_ZIP:
         ],
         required_in_zip=["data_processed/loso_results.pt"],
     )
-    print("Download from Kaggle Output tab (right sidebar).")
-    print(f"  Local extract: unzip {zip_name} -d ./my_run")
+    print("Save locally to results/results_classification_cross_attn_pooled_bio_only_weighted_no_aug/")
+
+print("\n[Kaggle] BIO-ONLY DONE.")
+print(f"  Zip: {ZIP_OUTPUT_NAME}")
+print("  Compare macro_f1 vs full multimodal baseline (0.185).")
+print("Download zip from Kaggle Output tab (right sidebar).")

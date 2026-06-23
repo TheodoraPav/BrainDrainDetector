@@ -1,8 +1,46 @@
 # BrainDrainDetector
 
-Multimodal detection of cognitive overload and socioemotional stress using the K EmoCon dataset.
+Multimodal detection of cognitive overload and socioemotional stress using the K-EmoCon dataset.
 
-The system fuses audio, E4 wristband physiological signals, and NeuroSky EEG data to predict a binary alarm state: **Safe** (0) or **Alarm** (1).
+Each 5-second window of a conversation is classified as **Safe (0)** or **Alarm (1)** based on self-reported arousal and valence. The system fuses audio (Wav2Vec2), E4 wristband physiological signals (EDA, HR, IBI), and NeuroSky EEG (θ, α, β).
+
+---
+
+## Labels
+
+Ground truth from self-annotations (`P{N}.self.csv`). Arousal and valence on a 1–5 scale.
+
+| Label | Name | Rule |
+|-------|------|------|
+| 0 | Safe | Valence > 3 OR Arousal < 4 |
+| 1 | Alarm | Valence ≤ 3 AND Arousal ≥ 4 |
+
+Class distribution after filtering: ~83% Safe, ~17% Alarm (1,492 total windows, 27 participants).
+
+---
+
+## Architecture
+
+- **Audio encoder:** Wav2Vec 2.0, pretrained, **frozen** during training. Fixed feature extractor.
+- **Biosignal encoder:** Bidirectional GRU (h=128). Input: 50×6 tensor (5 s window, 6 channels).
+- **Fusion:** configurable via `model.fusion_mode`. See table below.
+- **Head:** fully connected, 2 logits, CrossEntropyLoss with class weights.
+
+### Fusion modes
+
+| `fusion_mode` | Description |
+|---------------|-------------|
+| `cross_attn_pooled` (default) | Audio and pooled biosignal token in 256-d space, MultiHeadAttention with seq_len=1. Lightweight. |
+| `sequence_cross_attn` | Audio (Q, 1 token) attends over full BiGRU output sequence (K/V, 50 biosignal tokens). Real temporal attention weights. |
+| `gated_multimodal_unit` | Gate z = sigmoid(W·concat(a,b)) mixes audio and biosignal embeddings per feature. Dynamic modality contribution. |
+
+---
+
+## Dataset
+
+K-EmoCon: 10-minute dyadic debates between 27 participants. Audio is stereo WAV; physiological signals come from Empatica E4 and NeuroSky MindWave headsets. Raw data is **not included** in this repo.
+
+Place the dataset in `Data/` following the original K-EmoCon directory structure.
 
 ---
 
@@ -10,129 +48,184 @@ The system fuses audio, E4 wristband physiological signals, and NeuroSky EEG dat
 
 ```
 BrainDrainDetector/
-├── configs/                    # YAML experiment configurations
+├── configs/                        # YAML experiment configurations
 ├── src/
-│   ├── models/                 # Neural network components
-│   ├── data/                   # Dataset and augmentation
-│   ├── utils/                  # Metrics, plotting, quality parsing
-│   ├── 01_build_labels.py      # Build Safe/Alarm labels from self-annotations
-│   ├── 02_preprocess_audio.py  # Diarization, VAD, 5s window extraction
-│   ├── 03_preprocess_physio.py # E4 and NeuroSky windowing and quality check
-│   ├── 04_build_tensors.py     # Save ready-to-use PyTorch tensors
-│   ├── 05_train.py             # LOSO cross-validation training
-│   ├── 06_evaluate.py          # Metrics and plots
-│   └── 07_explain.py           # Attention map visualization
-├── report/                     # LaTeX academic report
-├── notebooks/                  # Exploratory analysis (not part of pipeline)
-├── Data/                       # Raw K EmoCon files — NOT in git
-└── data_processed/             # Processed PyTorch tensors — NOT in git
+│   ├── models/                     # Neural network components
+│   ├── data/                       # Dataset and augmentation
+│   ├── utils/                      # Metrics, plotting, quality parsing
+│   ├── 01_build_labels.py          # Build Safe/Alarm labels from self-annotations
+│   ├── 02_preprocess_audio.py      # Diarization, VAD, 5s window extraction
+│   ├── 03_preprocess_physio.py     # E4 and NeuroSky windowing and quality check
+│   ├── 04_build_tensors.py         # Save ready-to-use PyTorch tensors
+│   ├── 05_train.py                 # LOSO cross-validation training
+│   ├── 06_evaluate.py              # Metrics and plots
+│   ├── 07_explain.py               # Attention map visualization
+│   ├── 07_tune_alarm_threshold.py  # Post-hoc threshold sweep (no retraining)
+│   └── 08_late_fusion.py           # Decision-level late fusion pipeline
+├── notebooks/                      # Kaggle single-cell experiment scripts
+├── scripts/                        # Result export and analysis utilities
+├── report/                         # LaTeX source + compiled PDF
+├── Data/                           # Raw K-EmoCon files — NOT in git
+└── data_processed/                 # Processed PyTorch tensors — NOT in git
 ```
-
----
-
-## Labels
-
-Ground truth comes from **self-annotations only** (`P{N}.self.csv`). Emotion checkboxes in the CSV are ignored; each 5-second window uses **arousal** and **valence** (1–5) to assign a binary label:
-
-| Label | Name | Rule (from arousal *A*, valence *V*) |
-|-------|------|--------------------------------------|
-| 0 | Safe | Not overloaded: either *V* > 3 or *A* < 4 (includes “optimal” and “grey zone” VA states) |
-| 1 | Alarm | Overloaded: *V* ≤ 3 **and** *A* ≥ 4 |
-
-Thresholds are in `configs/base.yaml` (`labels.overloaded_*`, `labels.optimal_*`). Step 01 may print an internal VA-zone breakdown (optimal / overloaded / grey) for logging; **training and evaluation use only Safe vs Alarm** (`model.num_classes: 2`).
-
----
-
-## Audio Preprocessing
-
-For each stereo debate WAV file (e.g. `p1.p2.wav`):
-
-1. **Speaker diarization** runs on the mono mix `(left + right) / 2` (PyAnnote).
-2. Each diarized speaker is mapped globally to the left or right participant (P1/P2).
-3. The **other speaker is muted** on that participant's track.
-4. Short gaps within one turn are filled (`diarization_min_gap_sec`, default 3s).
-5. **VAD** runs once on each separated mono track (global speech timeline).
-6. The fixed **5-second annotation grid** is walked; a window is kept when speech overlap is at least `vad_min_overlap_sec` (default 3s) **or** at least `vad_min_overlap_pct` (default 60%).
-
-Config keys live under `data:` in `configs/base.yaml`.
-
-**Hugging Face models** (accept once with your token): `speaker-diarization-3.1`, `segmentation-3.0`, `wespeaker-voxceleb-resnet34-LM`, `voice-activity-detection`, `segmentation`.
-
-To export playable WAV files for manual listening checks:
-
-```bash
-python src/02_preprocess_audio.py --config configs/base.yaml --testing
-```
-
-This writes `data_processed/audio_preview/{participant}/*.wav` and `audio_preview/summary.csv`.
-
----
-
-## Experiments
-
-Two experiments compare augmentation strategies:
-
-1. **Baseline** — no augmentation (`configs/exp_baseline.yaml`)
-2. **Offline Augmentation** — noise added once during preprocessing (`configs/exp_offline_aug.yaml`)
-
----
-
-## Fusion Mode
-
-The fusion layer is selectable via `model.fusion_mode` in any YAML config:
-
-| `fusion_mode` | Description |
-|---------------|-------------|
-| `cross_attn_pooled` (default) | Audio (1 token) attends over a single pooled biosignal token. Lightweight baseline. |
-| `sequence_cross_attn` | Audio (1 token) attends over the BiGRU output sequence (T biosignal time steps). Produces real attention weights over time. Useful for visualizing where the model "looks" inside the biosignals. |
-
-To switch modes, set the value in `configs/base.yaml` (or override in an experiment config) and rerun `05_train.py`. Step 7 (`07_explain.py`) automatically picks the matching plot.
-
----
-
-## Audio Backbone (Frozen Wav2Vec2)
-
-The default audio encoder is pretrained Wav2Vec 2.0. Its weights are **frozen** during training (`model.freeze_audio_backbone: true` in `configs/base.yaml`). The model extracts fixed audio features and only trains the BiGRU biosignal encoder, fusion layer, and classification head.
-
-This keeps training stable on a medium-sized dataset and avoids catastrophic forgetting in the pretrained speech representations.
-
-To fine-tune Wav2Vec2 as well, set `freeze_audio_backbone: false` (only applies when `audio_encoder: "wav2vec2"`).
 
 ---
 
 ## Running the Pipeline
 
 ```bash
-# Step 1 — build labels
-python src/01_build_labels.py --config configs/base.yaml
+# Preprocessing
+python src/01_build_labels.py       --config configs/base.yaml
+python src/02_preprocess_audio.py   --config configs/base.yaml
+python src/03_preprocess_physio.py  --config configs/base.yaml
+python src/04_build_tensors.py      --config configs/base.yaml
 
-# Step 2 — preprocess audio
-python src/02_preprocess_audio.py --config configs/base.yaml
+# Training and evaluation
+python src/05_train.py              --config configs/exp_baseline.yaml
+python src/06_evaluate.py           --config configs/exp_baseline.yaml
 
-# Step 3 — preprocess physiological signals
-python src/03_preprocess_physio.py --config configs/base.yaml
-
-# Step 4 — build tensors
-python src/04_build_tensors.py --config configs/base.yaml
-
-# Step 5 — train (choose experiment config)
-python src/05_train.py --config configs/exp_baseline.yaml
-python src/05_train.py --config configs/exp_offline_aug.yaml
-
-# Step 6 — evaluate
-python src/06_evaluate.py --config configs/exp_offline_aug.yaml
-
-# Step 7 — explain (attention maps)
-python src/07_explain.py --config configs/exp_offline_aug.yaml
+# Optional post-hoc steps
+python src/07_explain.py            --config configs/exp_baseline.yaml
+python src/07_tune_alarm_threshold.py --config configs/exp_threshold_target_recall.yaml
+python src/08_late_fusion.py        --config configs/exp_late_fusion_audio_e4_eeg.yaml
 ```
 
 ---
 
-## Setup (local, Windows)
+## Experiments and Results
 
-### Μία φορά μόνο — εγκατάσταση
+All classification ablations use LOSO (27 folds), macro-F1 as selection metric, class-weighted loss, balanced sampling, batch size 8, and frozen Wav2Vec2. One architectural knob is changed per run.
 
-Αυτά **μένουν στον δίσκο**. Δεν τα ξανατρέχεις κάθε terminal.
+### Biosignal Encoder Ablation
+
+All runs use `cross_attn_pooled` fusion.
+
+| Encoder | Macro-F1 | Alarm Recall | Alarm F1 |
+|---------|----------|--------------|----------|
+| BiGRU h=128 (default) | **59.5%** | **51.2%** | **56.0%** |
+| BiGRU + inter-window GRU×5 | 53.16% | 29.2% | 40.28% |
+| BiGRU + inter-window LSTM×5 | lower | lower | lower |
+| 1D CNN front-end | 46.16% | 20.8% | 29.84% |
+
+Simple BiGRU wins. CNN overfits. Inter-window temporal models find no useful pattern across consecutive 5-second windows.
+
+### Fusion Architecture Comparison
+
+| Model | Macro-F1 | Alarm Recall | Alarm F1 |
+|-------|----------|--------------|----------|
+| Cross-attn pooled | **59.5%** | **51.2%** | **56.0%** |
+| Cross-attn sequence | 56.19% | 43.4% | 50.23% |
+| GMU | 46.97% | 21.2% | 30.64% |
+
+GMU underperforms: the gate collapses toward audio and the biosignal branch is not used effectively on this small noisy dataset.
+
+### Dual-Tower Biosignal Encoder
+
+Testing separate encoders for E4 (EDA/HR/IBI) and EEG (θ/α/β) towers, then concatenating into a 256-d vector.
+
+| Model | Macro-F1 | Alarm Recall |
+|-------|----------|--------------|
+| Joint BiGRU (single encoder) | **59.5%** | **51.2%** |
+| Dual-tower BiGRU | 48.06% | 24.2% |
+
+More parameters, worse generalization with 27 subjects. Dual-tower does not help.
+
+### Unimodal Ablations
+
+| Modality | Balanced Acc | Macro-F1 | Alarm Recall |
+|----------|-------------|----------|--------------|
+| Audio only | 54.46% | ~54.4% | 24.2% |
+| Bio only | 47.52% | ~47.3% | 9.6% |
+| Fusion (pooled) | 59.85% | 59.5% | 51.2% |
+
+Audio is stronger than bio alone. The fusion adds the most on Alarm Recall.
+
+### Late Fusion — 2 Modalities (Audio + Bio)
+
+Decision-level fusion of separately trained model probability outputs.
+
+| Strategy | Macro-F1 | Alarm Recall | Alarm F1 |
+|----------|----------|--------------|----------|
+| Quality-weighted | 45.82% | 18.4% | 27.67% |
+| Majority vote (OR) | 58.53% | 48.4% | 54.14% |
+| Stacking LR | **58.74%** | 47.6% | **53.91%** |
+
+### Late Fusion — 3 Modalities (Audio + E4 + EEG)
+
+| Strategy | Macro-F1 | Alarm Recall | Alarm F1 |
+|----------|----------|--------------|----------|
+| Quality-weighted | 44.2% | 14.2% | 22.94% |
+| Majority vote (OR) | 59.09% | 48.4% | 54.5% |
+| Stacking LR | **61.86%** | **51.6%** | **57.78%** |
+
+**Best overall result: Late fusion Stacking LR with 3 modalities (Macro-F1 = 61.86%).**
+
+### Best Single-Model Run
+
+Cross-attention pooled, BiGRU h=128, weighted loss, no augmentation.
+
+| Split | Accuracy | Macro-F1 | Alarm Recall | Alarm F1 | Alarm Precision |
+|-------|----------|----------|--------------|----------|-----------------|
+| Balanced (50/50 test) | 59.8% | 59.5% | 51.2% | 56.0% | 61.84% |
+| Real class distribution | 65.68% | 54.73% | 51.25% | 32.45% | 23.75% |
+
+Under real class distribution Alarm Precision drops sharply (many false alarms on a rare class).
+
+---
+
+## Modality Overlap Analysis
+
+Compared audio-only, bio-only, and fusion model predictions on the same 1,492 windows.
+
+| Metric | Value |
+|--------|-------|
+| Audio fail rate | 25.0% |
+| Bio fail rate | 26.74% |
+| Fusion fail rate | 34.32% |
+| Both unimodal correct | 62.27% |
+| Synergy: both wrong, fusion right | 5.63% |
+| Interference: both right, fusion wrong | **14.75%** |
+| Oracle (if at least one correct) | 85.99% |
+| Fusion follows audio when models disagree | **80.51%** |
+
+The fusion is heavily audio-biased. There is more interference than synergy — fusion sometimes hurts. This motivated trying late fusion at decision level (Stacking LR) instead of learned feature fusion.
+
+---
+
+## Key Findings
+
+**What worked:**
+- Class-weighted loss + balanced sampling — essential for non-trivial Alarm recall.
+- Frozen Wav2Vec2 — prevents catastrophic forgetting on a 27-subject dataset.
+- Late fusion Stacking LR with 3 modalities — best overall Macro-F1 (61.86%).
+- Cross-attn pooled with BiGRU — best single joint-model (59.5%).
+- Macro-F1 as selection metric — prevents collapse to always-Safe prediction.
+
+**What did not work:**
+- CNN physio front-end — overfits on 27 subjects.
+- Inter-window temporal models — no useful cross-window signal in 5-second clips.
+- Dual-tower biosignal encoder — too many parameters, worse generalization.
+- GMU — audio modality collapse; biosignals not learned.
+- Quality-weighted fusion — too conservative; downweights noisy but informative signals.
+- Offline augmentation — structural noise in dataset is not fixed by synthetic noise injection.
+
+**Dataset challenges:**
+- 27 participants, LOSO → tiny test sets, high fold variance.
+- 17% Alarm rate. Alarm windows are hard: audio fails on 76%, bio fails on 90% of them.
+- Some participants nearly perfectly predicted; others almost completely wrong (participant-level variance is larger than the model effect).
+- K-EmoCon papers note noisy physiological signals as a known limitation.
+
+---
+
+## Evaluation
+
+- **Primary metric:** Macro-F1
+- **Key secondary:** Alarm Recall (safety-critical — missing an alarm is worse than a false alarm)
+- **Validation:** LOSO cross-validation, 27 folds
+
+---
+
+## Setup
 
 ```powershell
 cd "c:\Users\theod\Desktop\Master\2ο εξάμηνο\Deep Learning\BrainDrainDetector"
@@ -142,49 +235,18 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-Το `pip install` κατεβάζει torch, pyannote κ.λπ. **μέσα στο `.venv`**. Μία φορά αρκεί, εκτός αν αλλάξει το `requirements.txt`.
-
-PyAnnote models (accept once on Hugging Face, same account as token):
-1. Token: https://huggingface.co/settings/tokens
-2. Accept: `pyannote/speaker-diarization-3.1`, `pyannote/segmentation-3.0`, `pyannote/wespeaker-voxceleb-resnet34-LM`, `pyannote/voice-activity-detection`, `pyannote/segmentation`
-
-### Κάθε φορά που ανοίγεις νέο terminal
-
-Νέο terminal = «ξέχασε» το venv. **Δεν** ξανακάνεις `pip install`. Απλά:
+Every new terminal session:
 
 ```powershell
-cd "c:\Users\theod\Desktop\Master\2ο εξάμηνο\Deep Learning\BrainDrainDetector"
 .\.venv\Scripts\Activate.ps1
-
 $env:HF_TOKEN = "hf_xxxxxxxx"
 $env:HUGGING_FACE_HUB_TOKEN = $env:HF_TOKEN
 ```
 
-Μετά τρέχεις scripts με `python` (τώρα δείχει στο `.venv`).
-
-### Audio preprocess + WAV preview (testing)
-
-```powershell
-python src/02_preprocess_audio.py --config configs/base.yaml --testing
-```
-
-Output:
-- `data_processed/audio/` — `.pt` tensors
-- `data_processed/audio_preview/` — `.wav` για ακρόαση + `summary.csv`
-
-**Σημαντικό:** Αν **δεν** κάνεις `Activate.ps1`, το `python` είναι του Windows και θα πει `No module named 'torch'`.
+PyAnnote models — accept on Hugging Face once:
+- `pyannote/speaker-diarization-3.1`
+- `pyannote/segmentation-3.0`
+- `pyannote/wespeaker-voxceleb-resnet34-LM`
+- `pyannote/voice-activity-detection`
 
 Python 3.10+ required.
-
----
-
-## Data
-
-The raw dataset (K EmoCon) is not included in this repository. Place the dataset in the `Data/` folder following the original K EmoCon directory structure. Processed tensors are saved to `data_processed/` after running the preprocessing scripts.
-
----
-
-## Evaluation
-
-Primary metric: Macro F1 Score. Secondary metrics: Cohen's Kappa, per-class Recall.
-Validation strategy: Leave One Subject Out (LOSO) cross-validation.
